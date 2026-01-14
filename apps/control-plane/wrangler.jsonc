@@ -1,0 +1,35 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "applepay-control-plane",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-13",
+  "assets": {
+    "directory": "../admin-ui/dist",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "kv_namespaces": [
+    { "binding": "APPLEPAY_KV" }
+  ],
+  "d1_databases": [
+    { "binding": "DB" }
+  ],
+  "mtls_certificates": [
+    {
+      "binding": "APPLE_MTLS",
+      "certificate_id": "REPLACE_WITH_YOUR_CLOUDFLARE_MTLS_CERTIFICATE_ID"
+    }
+  ],
+  "vars": {
+    "SHOPIFY_API_VERSION": "2026-01",
+    "SHOPIFY_SCOPES": "read_content,read_themes",
+    "APPLE_ENV": "production",
+    "APPLE_USE_JWT": "true",
+    "APPLE_VERIFICATION_KV_KEY": "applepay:partner-verification-file"
+  },
+  "triggers": {
+    "crons": ["0 * * * *"]
+  }
+}

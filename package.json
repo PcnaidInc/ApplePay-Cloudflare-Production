@@ -1,0 +1,19 @@
+{
+  "name": "applepay-shopify-cloudflare",
+  "private": true,
+  "workspaces": [
+    "apps/control-plane",
+    "apps/admin-ui"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  },
+  "scripts": {
+    "dev": "concurrently -n UI,WORKER -c auto \"npm -w apps/admin-ui run dev\" \"npm -w apps/control-plane run dev\"",
+    "build": "npm -w apps/admin-ui run build && npm -w apps/control-plane run build",
+    "deploy": "npm -w apps/admin-ui run build && npm -w apps/control-plane run deploy"
+  }
+}

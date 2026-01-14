@@ -1,0 +1,21 @@
+{
+  "name": "@applepay/control-plane",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "build": "wrangler types",
+    "deploy": "wrangler deploy",
+    "d1:migrate": "wrangler d1 migrations apply DB",
+    "kv:seed": "node ./scripts/seed-kv.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.6.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250105.0",
+    "typescript": "^5.5.4",
+    "wrangler": "^3.100.0"
+  }
+}
