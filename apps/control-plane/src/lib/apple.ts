@@ -20,7 +20,7 @@ async function importRsaPrivateKey(pkcs8Pem: string): Promise<CryptoKey> {
 }
 
 async function signRs256(privateKey: CryptoKey, data: Uint8Array): Promise<Uint8Array> {
-  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', privateKey, data);
+  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', privateKey, data.buffer as ArrayBuffer);
   return new Uint8Array(sig);
 }
 

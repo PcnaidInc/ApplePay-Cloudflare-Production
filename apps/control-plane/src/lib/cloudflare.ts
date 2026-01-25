@@ -2,6 +2,8 @@ export type CfCustomHostname = {
   id: string;
   hostname: string;
   status: string;
+  custom_origin_server?: string;
+  custom_origin_sni?: string;
   ssl?: {
     status?: string;
     method?: string;
@@ -52,6 +54,8 @@ export async function createCustomHostname(args: {
   zoneId: string;
   hostname: string;
   customMetadata?: Record<string, string>;
+  customOriginServer?: string;
+  customOriginSni?: string;
 }): Promise<CfCustomHostname> {
   return cfApiFetch<CfCustomHostname>({
     apiToken: args.apiToken,
@@ -60,6 +64,10 @@ export async function createCustomHostname(args: {
       method: 'POST',
       body: JSON.stringify({
         hostname: args.hostname,
+        // If provided, Cloudflare will connect to this origin (SNI = customOriginSni)
+        // while preserving the merchant's Host header.
+        custom_origin_server: args.customOriginServer ?? undefined,
+        custom_origin_sni: args.customOriginSni ?? undefined,
         ssl: {
           method: 'http',
           type: 'dv',
@@ -69,7 +77,27 @@ export async function createCustomHostname(args: {
             http2: 'on'
           },
         },
-        custom_metadata: args.customMetadata ?? undefined,
+      }),
+    },
+  });
+}
+
+export async function editCustomHostname(args: {
+  apiToken: string;
+  zoneId: string;
+  customHostnameId: string;
+  customOriginServer?: string;
+  customOriginSni?: string;
+  customMetadata?: Record<string, string>;
+}): Promise<CfCustomHostname> {
+  return cfApiFetch<CfCustomHostname>({
+    apiToken: args.apiToken,
+    path: `/zones/${args.zoneId}/custom_hostnames/${args.customHostnameId}`,
+    init: {
+      method: 'PATCH',
+      body: JSON.stringify({
+        custom_origin_server: args.customOriginServer ?? undefined,
+        custom_origin_sni: args.customOriginSni ?? undefined,
       }),
     },
   });

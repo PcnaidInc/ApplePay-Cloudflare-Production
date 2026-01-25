@@ -8,26 +8,42 @@
     "binding": "ASSETS"
   },
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
   },
   "kv_namespaces": [
-    { "binding": "APPLEPAY_KV" }
+    { "binding": "APPLEPAY_KV",
+      "id": "f8309ee4972841deaa3fa2ffdf55dca2"
+   }
   ],
   "d1_databases": [
-    { "binding": "DB" }
+    { "binding": "DB",
+      "database_name": "db",
+      "database_id": "f10d39fe-df27-436d-9802-3baa97724c34"
+    }
   ],
   "mtls_certificates": [
     {
       "binding": "APPLE_MTLS",
-      "certificate_id": "REPLACE_WITH_YOUR_CLOUDFLARE_MTLS_CERTIFICATE_ID"
+      "certificate_id": "acabc2a5-5ac7-4a1c-880d-4928fd9054b9"
     }
   ],
   "vars": {
     "SHOPIFY_API_VERSION": "2026-01",
-    "SHOPIFY_SCOPES": "read_content,read_themes",
+    "SHOPIFY_SCOPES": "read_content,read_themes,write_online_store_navigation",
     "APPLE_ENV": "production",
     "APPLE_USE_JWT": "true",
-    "APPLE_VERIFICATION_KV_KEY": "applepay:partner-verification-file"
+    "CF_ZONE_ID": "466bdf66d7498a2167140d334df52787",
+    "CF_SAAS_CNAME_TARGET": "dcv.pcnaid.com",
+    "APPLE_VERIFICATION_KV_KEY": "applepay:partner-verification-file",
+    "APPLE_ENCRYPT_TO": "platformintegrator.com.pcnaid.shopifyverifier",
+    "SHOPIFY_APP_URL": "https://applepay-control-plane.pcnaid.workers.dev"
   },
   "triggers": {
     "crons": ["0 * * * *"]

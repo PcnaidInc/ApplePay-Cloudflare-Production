@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import createApp from '@shopify/app-bridge';
-import { getSessionToken } from '@shopify/app-bridge/utilities';
+import { Redirect } from '@shopify/app-bridge/actions';
+import { authenticatedFetch } from '@shopify/app-bridge/utilities';
 import {
   Banner,
   BlockStack,
@@ -33,6 +34,7 @@ type ApplePayStatus = {
   status: string;
   lastError: string | null;
   cloudflareHostnameStatus: string | null;
+  cloudflareSslStatus: string | null;
   dnsInstructions?: {
     recordType: 'CNAME' | 'ALIAS' | 'ANAME';
     host: string;
@@ -66,8 +68,8 @@ export default function App() {
         if (!res.ok) throw new Error(`Failed to load config (${res.status})`);
         const json = (await res.json()) as Config;
         setConfig(json);
-      } catch (e: any) {
-        setConfigError(e?.message ?? String(e));
+      } catch (e: unknown) {
+        setConfigError(e instanceof Error ? e.message : String(e));
       }
     })();
   }, []);
@@ -81,23 +83,73 @@ export default function App() {
     });
   }, [config, host, shop]);
 
+  // App Bridge-aware fetch that injects a fresh session token automatically.
+  const appFetch = useMemo(() => {
+    if (!appBridge) return null;
+    return authenticatedFetch(appBridge);
+  }, [appBridge]);
+
   async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
-    if (!appBridge) throw new Error('App Bridge is not initialized (missing host/shop).');
-    const token = await getSessionToken(appBridge);
-    const res = await fetch(path, {
+    if (!appFetch) throw new Error('App Bridge is not initialized (missing host/shop).');
+    const res = await appFetch(path, {
       ...init,
       headers: {
         Accept: 'application/json',
-        'Content-Type': 'application/json',
+        ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
         ...(init?.headers ?? {}),
-        Authorization: `Bearer ${token}`,
       },
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`${path} failed (${res.status}): ${text || res.statusText}`);
+      let data: unknown = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = null;
+      }
+      const messageFromBody =
+        data && typeof data === 'object' && 'error' in data ? String((data as { error?: unknown }).error) : '';
+      const err = new Error(
+        `${path} failed (${res.status}): ${messageFromBody || text || res.statusText}`,
+      ) as Error & { status: number; body: string; data?: unknown };
+      err.status = res.status;
+      err.body = text;
+      err.data = data;
+      throw err;
     }
     return (await res.json()) as T;
+  }
+
+
+  function reauthenticate(reason?: string) {
+    if (!config || !shop || !host) return;
+    setInfoBanner(reason ?? 'Re-authenticating with Shopify…');
+
+    const url = new URL('/auth', config.appUrl);
+    url.searchParams.set('shop', shop);
+    url.searchParams.set('host', host);
+
+    // Prefer App Bridge's REMOTE redirect (official embedded-app way).
+    try {
+      if (appBridge) {
+        const redirect = Redirect.create(appBridge);
+        redirect.dispatch(Redirect.Action.REMOTE, url.toString());
+        return;
+      }
+    } catch {
+      // fall through
+    }
+
+    // Fallback: hard top-level navigation (works even if App Bridge isn't ready).
+    try {
+      if (window.top) {
+        window.top.location.href = url.toString();
+      } else {
+        window.location.href = url.toString();
+      }
+    } catch {
+      window.location.href = url.toString();
+    }
   }
 
   async function refresh() {
@@ -107,10 +159,20 @@ export default function App() {
     try {
       const shopData = await apiJson<ShopInfo>('/api/shop');
       setShopInfo(shopData);
-      const statusData = await apiJson<ApplePayStatus>('/api/applepay/status');
+      const qs = shopData.primaryDomain
+        ? `?domain=${encodeURIComponent(shopData.primaryDomain)}`
+        : '';
+      const statusData = await apiJson<ApplePayStatus>(`/api/applepay/status${qs}`);
       setStatus(statusData);
-    } catch (e: any) {
-      setErrorBanner(e?.message ?? String(e));
+    } catch (e: unknown) {
+      const statusCode = e && typeof e === 'object' && 'status' in e ? (e as { status: number }).status : undefined;
+      const msg = e instanceof Error ? e.message : String(e);
+      // If the shop is not in our DB yet (fresh D1, reinstall, etc.), kick off OAuth.
+      if (statusCode === 401) {
+        reauthenticate('Shop needs authentication. Redirecting to Shopify…');
+        return;
+      }
+      setErrorBanner(msg);
     } finally {
       setBusy(false);
     }
@@ -134,8 +196,18 @@ export default function App() {
       } else {
         setInfoBanner('Onboarding started. Follow the instructions below, then click Refresh.');
       }
-    } catch (e: any) {
-      setErrorBanner(e?.message ?? String(e));
+    } catch (e: unknown) {
+      const err = e as (Error & { data?: unknown });
+      if (err?.data && typeof err.data === 'object') {
+        const data = err.data as Partial<ApplePayStatus>;
+        if (data.dnsInstructions || data.status || data.domain) {
+          setStatus(data as ApplePayStatus);
+          if (data.dnsInstructions) {
+            setInfoBanner('DNS setup required. Follow the instructions below, then click Refresh.');
+          }
+        }
+      }
+      setErrorBanner(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -251,6 +323,9 @@ export default function App() {
                   </Text>
                   <Text as="p">
                     Cloudflare hostname: <Text as="span" fontWeight="bold">{status.cloudflareHostnameStatus ?? '—'}</Text>
+                  </Text>
+                  <Text as="p">
+                    Cloudflare SSL: <Text as="span" fontWeight="bold">{status.cloudflareSslStatus ?? '—'}</Text>
                   </Text>
                   {status.lastError ? (
                     <Banner tone="warning" title="Last error">

@@ -1,0 +1,8 @@
+[NewRequest]
+Subject = "CN=Pcnaid Apple Pay Integrator Identity"
+KeyAlgorithm = RSA
+KeyLength = 2048
+KeyUsage = "CERT_DIGITAL_SIGNATURE_KEY_USAGE"
+ProviderName = "Microsoft Software Key Storage Provider"
+RequestType = "PKCS10"
+Exportable = TRUE

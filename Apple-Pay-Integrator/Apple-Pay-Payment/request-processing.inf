@@ -1,0 +1,12 @@
+[Version]
+Signature="$Windows NT$"
+
+[NewRequest]
+Subject      = "CN=Pcnaid Apple Pay Payment Processing"
+KeyAlgorithm = ECDSA_P256        ; *must* be this exact token
+KeyLength    = 256               ; make the curve explicit
+HashAlgorithm= SHA256
+ProviderName = "Microsoft Software Key Storage Provider"
+Exportable   = TRUE
+RequestType  = PKCS10
+; ---------------------------------

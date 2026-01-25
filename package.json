@@ -9,7 +9,9 @@
     "node": ">=20.0.0"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0"
+    "@cloudflare/workers-types": "^4.20260115.0",
+    "concurrently": "^9.1.0",
+    "wrangler": "^4.60.0"
   },
   "scripts": {
     "dev": "concurrently -n UI,WORKER -c auto \"npm -w apps/admin-ui run dev\" \"npm -w apps/control-plane run dev\"",

@@ -55,7 +55,7 @@ export async function shopifyGraphql<T>(args: {
     },
     body: JSON.stringify({ query, variables }),
   });
-  const json = await res.json();
+  const json = (await res.json()) as { data?: T; errors?: any[] };
   if (!res.ok) {
     throw new Error(`Shopify GraphQL error (${res.status}): ${JSON.stringify(json)}`);
   }
@@ -70,16 +70,83 @@ export async function getShopInfo(args: {
   accessToken: string;
   apiVersion: string;
 }): Promise<{ shopId: string; name: string; primaryDomainHost: string | null }> {
-  const data = await shopifyGraphql<{ shop: { id: string; name: string; primaryDomain: { host: string } | null } }>(
-    {
-      ...args,
-      query: `query { shop { id name primaryDomain { host } } }`,
+
+  const isMyshopify = (host: string | null | undefined) => !!host && host.endsWith('.myshopify.com');
+
+  // 1) Primary path: Shopify GraphQL shop.primaryDomain
+  const base = await shopifyGraphql<{
+    shop: {
+      id: string;
+      name: string;
+      primaryDomain: { host: string; url?: string | null; sslEnabled?: boolean | null } | null;
+    };
+  }>({
+    ...args,
+    query: `query {
+      shop {
+        id
+        name
+        primaryDomain { host url sslEnabled }
+      }
+    }`,
+    variables: {},
+  });
+
+  let bestHost: string | null = base.shop.primaryDomain?.host ?? null;
+
+  // 2) Fallback: GraphQL shop.domains (more reliable in some Shopify stores)
+  if (!bestHost || isMyshopify(bestHost)) {
+    try {
+      const dom = await shopifyGraphql<{
+        shop: {
+          domains: Array<{ host: string; url: string; sslEnabled: boolean; isPrimary?: boolean | null }>;
+        };
+      }>({
+        ...args,
+        query: `query {
+          shop {
+            domains {
+              host
+              url
+              sslEnabled
+              isPrimary
+            }
+          }
+        }`,
+        variables: {},
+      });
+
+      const candidates = (dom.shop.domains ?? []).filter((d) => !!d.host && !isMyshopify(d.host) && d.sslEnabled);
+      const primary = candidates.find((d) => d.isPrimary) ?? candidates[0];
+      if (primary?.host) bestHost = primary.host;
+    } catch {
+      // Not all API versions expose shop.domains. We'll fall back to REST below.
     }
-  );
+  }
+
+  // 3) Final fallback: REST /shop.json (domain is the current primary domain)
+  if (!bestHost || isMyshopify(bestHost)) {
+    try {
+      const res = await fetch(`https://${args.shop}/admin/api/${args.apiVersion}/shop.json`, {
+        headers: {
+          'X-Shopify-Access-Token': args.accessToken,
+          Accept: 'application/json',
+        },
+      });
+      if (res.ok) {
+        const json = (await res.json()) as any;
+        const domain = (json?.shop?.domain as string | undefined) ?? null;
+        if (domain && !isMyshopify(domain)) bestHost = domain;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   return {
-    shopId: data.shop.id,
-    name: data.shop.name,
-    primaryDomainHost: data.shop.primaryDomain?.host ?? null,
+    shopId: base.shop.id,
+    name: base.shop.name,
+    primaryDomainHost: bestHost,
   };
 }
 

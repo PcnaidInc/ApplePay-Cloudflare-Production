@@ -1,0 +1,21 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "0a03a301c38af1ddffdd773a18e025f4"
+name = "Verify ApplePay"
+application_url = "https://applepay-control-plane.pcnaid.workers.dev"
+embedded = true
+handle = "verify-applepay"
+
+[webhooks]
+api_version = "2025-07"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_content,read_themes,write_online_store_navigation"
+optional_scopes = [ ]
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = [
+  "https://applepay-control-plane.pcnaid.workers.dev/auth/callback"
+]

@@ -1,217 +1,386 @@
 import { Hono } from 'hono';
-import { z } from 'zod';
+import { setCookie, getCookie, deleteCookie } from 'hono/cookie';
+import { cors } from 'hono/cors';
 
-import { parseCookies, serializeCookie } from './lib/cookies';
-import { verifyShopifyHmac } from './lib/shopifyHmac';
 import {
   buildShopifyAuthorizeUrl,
   exchangeAccessToken,
   getShopInfo,
-  registerWebhookAppUninstalled,
   isValidShopDomain,
+  registerAppUninstalledWebhook,
 } from './lib/shopify';
 import {
+  verifyShopifyHmac,
+  verifyShopifyWebhookHmac,
+} from './lib/shopifyHmac';
+import { verifyShopifySessionToken } from './lib/shopifySessionToken';
+import {
+  createPaymentSession,
+  getMerchantDetails,
+  registerMerchant,
+  unregisterMerchant,
+} from './lib/apple';
+import {
+  createCustomHostname,
+  deleteCustomHostname,
+  editCustomHostname,
+  findCustomHostname,
+} from './lib/cloudflare';
+import {
+  getMerchantDomainByDomain,
+  getMerchantDomainByShop,
   getShopByShop,
   logWebhookEvent,
   markShopUninstalled,
   upsertMerchantDomain,
   upsertShop,
-  getMerchantDomainByShop,
-  getMerchantDomainByDomain,
   updateMerchantDomainAppleStatus,
   updateMerchantDomainCloudflareStatus,
+  type MerchantDomainRow,
 } from './lib/db';
-import { verifyShopifySessionToken } from './lib/shopifySessionToken';
-import { createCustomHostname, deleteCustomHostname, findCustomHostnameByHostname } from './lib/cloudflare';
-import { getMerchantDetails, registerMerchant, createPaymentSession, unregisterMerchant, getApplePayBaseUrl } from './lib/apple';
+import {
+  nowIso,
+  randomState,
+  sha256Hex,
+} from './lib/util';
 
-export interface Env {
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+
+type Fetcher = {
+  fetch(input: URL | RequestInfo, init?: RequestInit): Promise<Response>;
+};
+
+type Env = {
+  // Storage
   DB: D1Database;
   APPLEPAY_KV: KVNamespace;
+
+  // Static assets (built admin-ui)
   ASSETS: Fetcher;
+
+  // Outbound mTLS to Apple (configured in wrangler via mtls_certificates)
   APPLE_MTLS: Fetcher;
 
+  // Shopify
   SHOPIFY_API_KEY: string;
   SHOPIFY_API_SECRET: string;
+  SHOPIFY_API_VERSION: string;
   SHOPIFY_SCOPES: string;
   SHOPIFY_APP_URL: string;
-  SHOPIFY_API_VERSION: string;
 
+  // Cloudflare for SaaS (Custom Hostnames)
   CF_API_TOKEN: string;
   CF_ZONE_ID: string;
   CF_SAAS_CNAME_TARGET: string;
 
+  // Apple Pay (Web Merchant Registration API)
   APPLE_ENV: 'production' | 'sandbox';
   APPLE_ENCRYPT_TO: string;
   APPLE_USE_JWT: 'true' | 'false';
   APPLE_JWT_CERT_PEM: string;
   APPLE_JWT_PRIVATE_KEY_PEM: string;
-  APPLE_VERIFICATION_KV_KEY: string;
+  APPLE_VERIFICATION_KV_KEY?: string;
+};
 
-  LOG_LEVEL?: string;
+type ShopifySessionPayload = {
+  iss: string;
+  dest: string; // https://{shop}.myshopify.com
+  aud: string;
+  sub: string;
+  exp: number;
+  nbf: number;
+  iat: number;
+  jti: string;
+  sid?: string;
+};
+
+function normalizeShopParam(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/.*/, '');
 }
+
+function oauthBounceHtml(authUrl: string): string {
+  // Shopify OAuth must run at the top-level (not inside the Shopify Admin iframe).
+  // This tiny page is served when we detect the shop isn't installed in our DB yet.
+  const safeUrl = JSON.stringify(authUrl);
+  return `<!doctype html><html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Redirecting…</title></head><body><script>(function(){var url=${safeUrl};try{if(window.top){window.top.location.href=url;}else{window.location.href=url;}}catch(e){window.location.href=url;}})();</script><p>Redirecting to Shopify authentication…</p></body></html>`;
+}
+
+type ShopInfoApi = {
+  shop: string;
+  shopId: string;
+  shopName: string;
+  primaryDomain: string | null;
+};
+
+type DnsInstructionsApi = {
+  recordType: 'CNAME' | 'ALIAS' | 'ANAME';
+  host: string;
+  value: string;
+  note?: string;
+};
+
+type ApplePayStatusApi = {
+  domain: string | null;
+  status: 'NOT_STARTED' | 'DNS_NOT_CONFIGURED' | 'PENDING' | 'VERIFIED' | 'ERROR' | 'UNREGISTERED';
+  lastError: string | null;
+  cloudflareHostnameStatus: string | null;
+  cloudflareSslStatus: string | null;
+  dnsInstructions: DnsInstructionsApi | null;
+  appleMerchantId: string | null;
+};
+
+// -----------------------------------------------------------------------------
+// App
+// -----------------------------------------------------------------------------
 
 const app = new Hono<{ Bindings: Env }>();
 
-function appHostname(env: Env): string {
-  const u = new URL(env.SHOPIFY_APP_URL);
-  return u.hostname;
+const WELL_KNOWN_PATH = '/.well-known/apple-developer-merchantid-domain-association';
+const DEFAULT_VERIFICATION_KV_KEY = 'applepay:partner-verification-file';
+const OAUTH_STATE_COOKIE = '__applepay_oauth_state';
+
+function isAppHost(env: Env, url: URL): boolean {
+  try {
+    const appHost = new URL(env.SHOPIFY_APP_URL).hostname;
+    return url.hostname === appHost;
+  } catch {
+    return false;
+  }
 }
 
-function isAppHost(env: Env, requestUrl: URL): boolean {
-  return requestUrl.hostname === appHostname(env);
+function noStoreHeaders(): Record<string, string> {
+  return {
+    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+    'Pragma': 'no-cache',
+    'Expires': '0',
+  };
 }
 
-function json<T>(data: T, init: ResponseInit = {}): Response {
-  const headers = new Headers(init.headers);
-  headers.set('Content-Type', 'application/json; charset=utf-8');
-  return new Response(JSON.stringify(data), { ...init, headers });
+function cspHeaders(): Record<string, string> {
+  // Embedded app: allow iframe in Shopify Admin.
+  return {
+    'Content-Security-Policy': [
+      "frame-ancestors https://*.myshopify.com https://admin.shopify.com",
+    ].join('; '),
+  };
 }
 
-function text(data: string, init: ResponseInit = {}): Response {
-  const headers = new Headers(init.headers);
-  headers.set('Content-Type', 'text/plain; charset=utf-8');
-  return new Response(data, { ...init, headers });
+async function getPartnerVerificationFile(env: Env): Promise<string> {
+  const key = env.APPLE_VERIFICATION_KV_KEY ?? DEFAULT_VERIFICATION_KV_KEY;
+  const file = await env.APPLEPAY_KV.get(key);
+  if (!file) {
+    throw new Error(`Missing partner verification file in KV at key: ${key}`);
+  }
+  return file;
 }
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
+async function requireShopifySession(c: any): Promise<ShopifySessionPayload | Response> {
+  const auth = c.req.header('Authorization') || '';
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) {
+    return c.json({ error: 'Missing Authorization: Bearer <token>' }, 401);
+  }
+  const token = m[1];
 
-function normalizeDomain(host: string): string {
-  return host.toLowerCase().replace(/\.$/, '');
-}
-
-async function requireSession(c: any) {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ ok: false, error: 'Missing Authorization header' }, 401);
-  const token = auth.slice('Bearer '.length);
-  const payload = await verifyShopifySessionToken({
-    token,
-    apiKey: c.env.SHOPIFY_API_KEY,
-    apiSecret: c.env.SHOPIFY_API_SECRET,
-  });
+  let payload: ShopifySessionPayload;
+  try {
+    payload = (await verifyShopifySessionToken(
+      token,
+      c.env.SHOPIFY_API_KEY,
+      c.env.SHOPIFY_API_SECRET
+    )) as ShopifySessionPayload;
+  } catch {
+    return c.json({ error: 'Invalid Shopify session token' }, 401);
+  }
   return payload;
 }
 
-// --- Merchant-domain routes (these can run on ANY hostname) ---
+function shopFromDest(dest: string): string {
+  // dest is like: https://{shop}.myshopify.com
+  const u = new URL(dest);
+  return u.hostname;
+}
 
-app.get('/.well-known/apple-developer-merchantid-domain-association', async (c) => {
-  const key = c.env.APPLE_VERIFICATION_KV_KEY || 'applepay:partner-verification-file';
-  const body = await c.env.APPLEPAY_KV.get(key);
-  if (!body) {
-    return text('Partner verification file missing from KV.', { status: 500 });
-  }
-  return text(body, {
-    status: 200,
-    headers: {
-      'Cache-Control': 'public, max-age=300',
-    },
-  });
-});
-
-const ApplePaySessionRequestSchema = z.object({
-  validationURL: z.string().url(),
-});
-
-app.options('/applepay/session', (c) => {
-  const origin = c.req.header('Origin') ?? '*';
-  return new Response(null, {
-    status: 204,
-    headers: {
-      'Access-Control-Allow-Origin': origin,
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-      'Access-Control-Max-Age': '86400',
-    },
-  });
-});
-
-app.post('/applepay/session', async (c) => {
-  const url = new URL(c.req.url);
-  const host = normalizeDomain(url.hostname);
-
-  // This endpoint is intended to be called from the merchant storefront.
-  // We look up the merchant by domain.
-  const merchant = await getMerchantDomainByDomain(c.env.DB, host);
-  if (!merchant) {
-    return json({ ok: false, error: `Domain not onboarded: ${host}` }, { status: 404 });
+function toApplePayStatus(row: MerchantDomainRow | null, dnsInstructions: DnsInstructionsApi | null = null): ApplePayStatusApi {
+  if (!row) {
+    return {
+      domain: null,
+      status: 'NOT_STARTED',
+      lastError: null,
+      cloudflareHostnameStatus: null,
+      cloudflareSslStatus: null,
+      dnsInstructions: null,
+      appleMerchantId: null,
+    };
   }
 
-  const origin = c.req.header('Origin') ?? '';
-  // If the Origin header is present, require it to match the current host.
-  if (origin) {
-    try {
-      const o = new URL(origin);
-      if (normalizeDomain(o.hostname) !== host) {
-        return json({ ok: false, error: 'Origin mismatch.' }, { status: 403 });
-      }
-    } catch {
-      return json({ ok: false, error: 'Invalid Origin header.' }, { status: 400 });
+  return {
+    domain: row.domain,
+    status: (row.status as ApplePayStatusApi['status']) ?? 'NOT_STARTED',
+    lastError: row.last_error,
+    cloudflareHostnameStatus: row.cloudflare_hostname_status,
+    cloudflareSslStatus: row.cloudflare_ssl_status,
+    dnsInstructions,
+    appleMerchantId: row.partner_internal_merchant_identifier,
+  };
+}
+
+async function preflightVerificationFile(domain: string, expectedFile: string): Promise<{ ok: boolean; reason?: string }> {
+  const url = `https://${domain}${WELL_KNOWN_PATH}`;
+  try {
+    const res = await fetch(url, { method: 'GET' });
+    if (!res.ok) {
+      return { ok: false, reason: `HTTP ${res.status} fetching ${url}` };
     }
+    const body = await res.text();
+    // Compare by hash to avoid whitespace/line-ending differences.
+    const got = await sha256Hex(body.trim());
+    const want = await sha256Hex(expectedFile.trim());
+    if (got !== want) {
+      return { ok: false, reason: `Verification file mismatch at ${url}` };
+    }
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, reason: `Failed fetching ${url}: ${e?.message || String(e)}` };
   }
+}
 
-  const body = await c.req.json().catch(() => null);
-  const parsed = ApplePaySessionRequestSchema.safeParse(body);
-  if (!parsed.success) {
-    return json({ ok: false, error: parsed.error.flatten() }, { status: 400 });
+function dnsInstructionsFor(domain: string, target: string): DnsInstructionsApi {
+  return {
+    recordType: 'CNAME',
+    host: domain,
+    value: target,
+    note:
+      'If your DNS provider does not allow CNAME at the apex (root), use an ALIAS/ANAME (or CNAME flattening if using Cloudflare DNS). After DNS propagates, click “Refresh” in this app.',
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Public (merchant-domain) routes
+// -----------------------------------------------------------------------------
+
+// The domain verification file must be served on EVERY merchant domain at the exact path.
+app.get(WELL_KNOWN_PATH, async (c) => {
+  try {
+    const file = await getPartnerVerificationFile(c.env);
+    return new Response(file, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        ...noStoreHeaders(),
+      },
+    });
+  } catch (e: any) {
+    return c.text(e?.message || 'Missing verification file', 500);
   }
-
-  // Apple requires that we ONLY call validation URLs provided by Apple.
-  const validationUrl = new URL(parsed.data.validationURL);
-  if (!/apple\.com$/i.test(validationUrl.hostname) || !/apple-pay-gateway/i.test(validationUrl.hostname)) {
-    return json({ ok: false, error: 'validationURL host is not allowed.' }, { status: 400 });
-  }
-
-  const displayName = merchant.partner_merchant_name;
-  const merchantIdentifier = merchant.partner_internal_merchant_identifier;
-
-  const session = await createPaymentSession(c.env, {
-    validationURL: parsed.data.validationURL,
-    merchantIdentifier,
-    displayName,
-    initiativeContext: host,
-  });
-
-  const resp = json(session, {
-    status: 200,
-    headers: {
-      'Access-Control-Allow-Origin': origin || '*',
-      'Access-Control-Allow-Headers': 'Content-Type',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Cache-Control': 'no-store',
-    },
-  });
-  return resp;
 });
 
-// --- App-host-only routes ---
+// Optional (but implemented): Apple Pay merchant validation sessions.
+// This is used by storefront JS (same-origin) to exchange Apple’s validationURL for a merchant session.
+app.post(
+  '/applepay/session',
+  cors({ origin: '*', allowMethods: ['POST', 'OPTIONS'], allowHeaders: ['Content-Type'] }),
+  async (c) => {
+    const host = new URL(c.req.url).hostname;
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body.validationURL !== 'string') {
+      return c.json({ error: 'Missing validationURL' }, 400);
+    }
 
+    // Find merchant by exact hostname; also try stripping "www.".
+    const row =
+      (await getMerchantDomainByDomain(c.env.DB, host)) ||
+      (host.startsWith('www.') ? await getMerchantDomainByDomain(c.env.DB, host.slice(4)) : null);
+
+    if (!row) {
+      return c.json({ error: `No merchant registered for domain: ${host}` }, 404);
+    }
+    if (row.status !== 'VERIFIED') {
+      return c.json({ error: `Domain not verified/registered yet: ${row.domain}` }, 409);
+    }
+
+    const initiativeContext = `https://${host}`;
+    const merchantIdentifier = row.partner_internal_merchant_identifier;
+
+    const session = await createPaymentSession({
+      fetcher: c.env.APPLE_MTLS,
+      validationUrl: body.validationURL,
+      merchantIdentifier,
+      displayName: row.partner_merchant_name,
+      initiativeContext,
+    });
+    return c.json(session);
+  },
+);
+
+// -----------------------------------------------------------------------------
+// App-host routes (Shopify embedded app)
+// -----------------------------------------------------------------------------
+
+// Config for the React admin UI (Shopify App Bridge needs apiKey + host).
 app.get('/api/config', async (c) => {
   const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return json({ ok: false, error: 'Not found' }, { status: 404 });
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
-  return json({
-    ok: true,
-    config: {
+  // Fail loudly if env isn't configured, instead of returning undefined values
+  // that cause App Bridge to throw a confusing INVALID_CONFIG error.
+  const missing: string[] = [];
+  if (!c.env.SHOPIFY_API_KEY) missing.push('SHOPIFY_API_KEY');
+  if (!c.env.SHOPIFY_APP_URL) missing.push('SHOPIFY_APP_URL');
+  if (missing.length) {
+    return c.json(
+      {
+        error: `Missing required environment variables: ${missing.join(', ')}`,
+      },
+      500,
+      {
+        ...noStoreHeaders(),
+      },
+    );
+  }
+
+  return c.json(
+    {
       shopifyApiKey: c.env.SHOPIFY_API_KEY,
       appUrl: c.env.SHOPIFY_APP_URL,
     },
-  });
+    200,
+    {
+      ...noStoreHeaders(),
+    },
+  );
 });
 
+// Start OAuth
 app.get('/auth', async (c) => {
   const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return c.redirect(c.env.SHOPIFY_APP_URL);
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
-  const shop = u.searchParams.get('shop') ?? '';
-  const host = u.searchParams.get('host') ?? '';
-  if (!isValidShopDomain(shop) || !host) {
-    return json({ ok: false, error: 'Missing or invalid shop/host' }, { status: 400 });
+  const shop = (u.searchParams.get('shop') || '').trim();
+  const host = (u.searchParams.get('host') || '').trim();
+  if (!isValidShopDomain(shop)) {
+    return c.text('Invalid shop parameter', 400);
+  }
+  if (!host) {
+    return c.text('Missing host parameter', 400);
   }
 
-  const state = crypto.randomUUID();
-  const redirectUri = new URL('/auth/callback', c.env.SHOPIFY_APP_URL).toString();
+  const state = randomState();
+  setCookie(c, OAUTH_STATE_COOKIE, state, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 60 * 10,
+  });
+
+  const redirectUri = `${c.env.SHOPIFY_APP_URL}/auth/callback`;
   const authorizeUrl = buildShopifyAuthorizeUrl({
     shop,
     apiKey: c.env.SHOPIFY_API_KEY,
@@ -220,43 +389,33 @@ app.get('/auth', async (c) => {
     state,
   });
 
-  const cookie = serializeCookie('oauth_state', state, {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'Lax',
-    path: '/auth/callback',
-    maxAge: 300,
-  });
-
-  return c.redirect(authorizeUrl, 302, {
-    'Set-Cookie': cookie,
-  });
+  return c.redirect(authorizeUrl, 302);
 });
 
+// OAuth callback
 app.get('/auth/callback', async (c) => {
   const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return json({ ok: false, error: 'Not found' }, { status: 404 });
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
-  const okHmac = await verifyShopifyHmac({ url: u, apiSecret: c.env.SHOPIFY_API_SECRET });
-  if (!okHmac) {
-    return json({ ok: false, error: 'HMAC verification failed' }, { status: 400 });
+  const shop = (u.searchParams.get('shop') || '').trim();
+  const host = (u.searchParams.get('host') || '').trim();
+  const code = (u.searchParams.get('code') || '').trim();
+  const state = (u.searchParams.get('state') || '').trim();
+
+  if (!shop || !host || !code || !state) {
+    return c.text('Missing OAuth callback parameters', 400);
+  }
+  if (!(await verifyShopifyHmac({ url: u, apiSecret: c.env.SHOPIFY_API_SECRET }))) {
+    return c.text('Invalid HMAC', 400);
   }
 
-  const shop = u.searchParams.get('shop') ?? '';
-  const code = u.searchParams.get('code') ?? '';
-  const state = u.searchParams.get('state') ?? '';
-  const host = u.searchParams.get('host') ?? '';
-
-  if (!isValidShopDomain(shop) || !code || !state || !host) {
-    return json({ ok: false, error: 'Missing required OAuth params' }, { status: 400 });
+  const cookieState = getCookie(c, OAUTH_STATE_COOKIE);
+  if (!cookieState || cookieState !== state) {
+    return c.text('Invalid OAuth state', 400);
   }
+  deleteCookie(c, OAUTH_STATE_COOKIE, { path: '/' });
 
-  const cookies = parseCookies(c.req.header('Cookie') ?? null);
-  if (cookies.oauth_state !== state) {
-    return json({ ok: false, error: 'Invalid OAuth state' }, { status: 400 });
-  }
-
-  const { access_token, scope } = await exchangeAccessToken({
+  const tokenRes = await exchangeAccessToken({
     shop,
     apiKey: c.env.SHOPIFY_API_KEY,
     apiSecret: c.env.SHOPIFY_API_SECRET,
@@ -265,117 +424,143 @@ app.get('/auth/callback', async (c) => {
 
   const info = await getShopInfo({
     shop,
-    accessToken: access_token,
+    accessToken: tokenRes.accessToken,
     apiVersion: c.env.SHOPIFY_API_VERSION,
   });
 
   await upsertShop(c.env.DB, {
     shop,
-    shopId: info.id,
+    shopId: info.shopId,
     shopName: info.name,
-    accessToken: access_token,
-    scopes: scope,
+    accessToken: tokenRes.accessToken,
+    scopes: tokenRes.scope,
     installedAt: nowIso(),
   });
 
-  // Register APP_UNINSTALLED webhook
+  // Keep install -> uninstall lifecycle clean.
   try {
-    await registerWebhookAppUninstalled({
+    await registerAppUninstalledWebhook({
       shop,
-      accessToken: access_token,
+      accessToken: tokenRes.accessToken,
       apiVersion: c.env.SHOPIFY_API_VERSION,
-      callbackUrl: new URL('/webhooks/shopify/app-uninstalled', c.env.SHOPIFY_APP_URL).toString(),
+      callbackUrl: `${c.env.SHOPIFY_APP_URL}/webhooks/shopify/app-uninstalled`,
     });
-  } catch (e) {
-    // Non-fatal; webhooks can be re-registered later
-    console.warn('Failed to register webhook:', e);
+  } catch (e: any) {
+    const message = e?.message || String(e);
+    if (!message.includes('Address for this topic has already been taken')) {
+      throw e;
+    }
+    console.warn('Webhook already registered. Skipping duplicate registration.');
   }
 
-  // Clear state cookie
-  const clearCookie = serializeCookie('oauth_state', '', {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'Lax',
-    path: '/auth/callback',
-    maxAge: 0,
-  });
-
-  const redirectToApp = new URL(c.env.SHOPIFY_APP_URL);
-  redirectToApp.searchParams.set('shop', shop);
-  redirectToApp.searchParams.set('host', host);
-
-  return c.redirect(redirectToApp.toString(), 302, {
-    'Set-Cookie': clearCookie,
-  });
+  // Back into the embedded app.
+  return c.redirect(`${c.env.SHOPIFY_APP_URL}/?shop=${encodeURIComponent(shop)}&host=${encodeURIComponent(host)}`, 302);
 });
 
-// Authenticated API: shop info
+// Shopify webhook: app/uninstalled
+app.post('/webhooks/shopify/app-uninstalled', async (c) => {
+  const raw = await c.req.text();
+  const hmac = c.req.header('X-Shopify-Hmac-Sha256') || '';
+  const topic = c.req.header('X-Shopify-Topic') || 'app/uninstalled';
+  const webhookId = c.req.header('X-Shopify-Webhook-Id') || '';
+  const shop = (c.req.header('X-Shopify-Shop-Domain') || '').trim();
+
+  const receivedAt = nowIso();
+  let status: 'OK' | 'ERROR' = 'OK';
+
+  try {
+    const rawBytes = new TextEncoder().encode(raw);
+    if (!(await verifyShopifyWebhookHmac({ apiSecret: c.env.SHOPIFY_API_SECRET, rawBody: rawBytes, hmacHeader: hmac }))) {
+      status = 'ERROR';
+      await logWebhookEvent(c.env.DB, {
+        shop: shop || 'unknown',
+        topic,
+        webhookId,
+        payload: raw,
+        receivedAt,
+        processedAt: nowIso(),
+        status: 'ERROR',
+      });
+      return c.text('Invalid webhook HMAC', 401);
+    }
+
+    if (shop) {
+      await markShopUninstalled(c.env.DB, shop, nowIso());
+
+      // Best-effort cleanup: unregister merchant + delete custom hostname.
+      const md = await getMerchantDomainByShop(c.env.DB, shop);
+      if (md?.partner_internal_merchant_identifier) {
+        try {
+          await unregisterMerchant({
+            fetcher: c.env.APPLE_MTLS,
+            appleEnv: c.env.APPLE_ENV,
+            merchantIdentifier: md.partner_internal_merchant_identifier,
+            useJwt: c.env.APPLE_USE_JWT === 'true',
+            issuer: c.env.APPLE_ENCRYPT_TO,
+            certificatePem: c.env.APPLE_JWT_CERT_PEM,
+            privateKeyPem: c.env.APPLE_JWT_PRIVATE_KEY_PEM,
+          });
+          await updateMerchantDomainAppleStatus(c.env.DB, {
+            domain: md.domain,
+            status: 'UNREGISTERED',
+            lastError: null,
+            appleLastCheckedAt: nowIso(),
+          });
+        } catch (e: any) {
+          // Keep going.
+        }
+      }
+
+      if (md?.cloudflare_hostname_id) {
+        try {
+          await deleteCustomHostname({
+            apiToken: c.env.CF_API_TOKEN,
+            zoneId: c.env.CF_ZONE_ID,
+            customHostnameId: md.cloudflare_hostname_id,
+          });
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    await logWebhookEvent(c.env.DB, {
+      shop: shop || 'unknown',
+      topic,
+      webhookId,
+      payload: raw,
+      receivedAt,
+      processedAt: nowIso(),
+      status: 'OK',
+    });
+  } catch (e: any) {
+    status = 'ERROR';
+    await logWebhookEvent(c.env.DB, {
+      shop: shop || 'unknown',
+      topic,
+      webhookId,
+      payload: raw,
+      receivedAt,
+      processedAt: nowIso(),
+      status: 'ERROR',
+    });
+  }
+
+  return c.text('OK', 200);
+});
+
+// Session-authenticated API: shop info
 app.get('/api/shop', async (c) => {
   const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return json({ ok: false, error: 'Not found' }, { status: 404 });
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
-  const payload = await requireSession(c);
-  if (!payload || payload instanceof Response) return payload;
+  const payload = await requireShopifySession(c);
+  if (payload instanceof Response) return payload;
 
-  const shop = normalizeDomain(new URL(payload.dest).hostname);
-  if (!isValidShopDomain(shop)) return json({ ok: false, error: 'Invalid shop' }, { status: 400 });
-
-  const row = await getShopByShop(c.env.DB, shop);
-  if (!row || row.uninstalled_at) {
-    return json({ ok: false, error: 'Shop not installed' }, { status: 401 });
-  }
-
-  // Refresh shop info from Shopify (domain can change)
-  const info = await getShopInfo({
-    shop,
-    accessToken: row.access_token,
-    apiVersion: c.env.SHOPIFY_API_VERSION,
-  });
-
-  return json({
-    ok: true,
-    shop: {
-      shop,
-      id: info.id,
-      name: info.name,
-      primaryDomain: info.primaryDomain,
-    },
-  });
-});
-
-app.get('/api/applepay/status', async (c) => {
-  const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return json({ ok: false, error: 'Not found' }, { status: 404 });
-
-  const payload = await requireSession(c);
-  if (!payload || payload instanceof Response) return payload;
-
-  const shop = normalizeDomain(new URL(payload.dest).hostname);
-  const row = await getMerchantDomainByShop(c.env.DB, shop);
-  return json({ ok: true, merchant: row });
-});
-
-const OnboardRequestSchema = z.object({
-  force: z.boolean().optional(),
-});
-
-app.post('/api/applepay/onboard', async (c) => {
-  const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return json({ ok: false, error: 'Not found' }, { status: 404 });
-
-  const payload = await requireSession(c);
-  if (!payload || payload instanceof Response) return payload;
-  const shop = normalizeDomain(new URL(payload.dest).hostname);
-
+  const shop = shopFromDest(payload.dest);
   const shopRow = await getShopByShop(c.env.DB, shop);
   if (!shopRow || shopRow.uninstalled_at) {
-    return json({ ok: false, error: 'Shop not installed' }, { status: 401 });
-  }
-
-  const body = await c.req.json().catch(() => ({}));
-  const parsedBody = OnboardRequestSchema.safeParse(body);
-  if (!parsedBody.success) {
-    return json({ ok: false, error: parsedBody.error.flatten() }, { status: 400 });
+    return c.json({ error: 'App not installed for this shop' }, 401);
   }
 
   const info = await getShopInfo({
@@ -384,367 +569,316 @@ app.post('/api/applepay/onboard', async (c) => {
     apiVersion: c.env.SHOPIFY_API_VERSION,
   });
 
-  const domain = normalizeDomain(info.primaryDomain);
-  if (domain.endsWith('.myshopify.com')) {
-    return json({
-      ok: false,
-      error:
-        'Your store does not have a custom domain set as its primary domain. Apple Pay domain verification requires a custom domain.',
-    }, { status: 400 });
-  }
-
-  // 1) Ensure Cloudflare custom hostname exists
-  let cf = await findCustomHostnameByHostname(c.env, domain);
-  if (!cf) {
-    cf = await createCustomHostname(c.env, domain);
-  }
-
-  await updateMerchantDomainCloudflareStatus(c.env.DB, {
+  const out: ShopInfoApi = {
     shop,
-    domain,
-    hostnameId: cf.id,
-    hostnameStatus: cf.status,
-    sslStatus: cf.ssl?.status ?? null,
-    lastError: cf.ssl?.validation_errors?.length ? JSON.stringify(cf.ssl.validation_errors) : null,
+    shopId: info.shopId,
+    shopName: info.name,
+    primaryDomain: info.primaryDomainHost || null,
+  };
+
+  return c.json(out, 200, { ...noStoreHeaders() });
+});
+
+// Session-authenticated API: current Apple Pay status
+app.get('/api/applepay/status', async (c) => {
+  const u = new URL(c.req.url);
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
+
+  const payload = await requireShopifySession(c);
+  if (payload instanceof Response) return payload;
+
+  const shop = shopFromDest(payload.dest);
+  const shopRow = await getShopByShop(c.env.DB, shop);
+  if (!shopRow || shopRow.uninstalled_at) {
+    return c.json({ error: 'App not installed for this shop' }, 401);
+  }
+
+  const requestedDomain = (c.req.query('domain') || '').trim().toLowerCase();
+  let md = null as Awaited<ReturnType<typeof getMerchantDomainByShop>>;
+  if (requestedDomain) {
+    const byDomain = await getMerchantDomainByDomain(c.env.DB, requestedDomain);
+    if (byDomain && byDomain.shop === shop) md = byDomain;
+  }
+  if (!md) {
+    md = await getMerchantDomainByShop(c.env.DB, shop);
+  }
+  return c.json(toApplePayStatus(md), 200, { ...noStoreHeaders() });
+});
+
+// Session-authenticated API: onboard (domain verification + registerMerchant)
+app.post('/api/applepay/onboard', async (c) => {
+  const u = new URL(c.req.url);
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
+
+  const payload = await requireShopifySession(c);
+  if (payload instanceof Response) return payload;
+
+  const shop = shopFromDest(payload.dest);
+  const shopRow = await getShopByShop(c.env.DB, shop);
+  if (!shopRow || shopRow.uninstalled_at) {
+    return c.json({ error: 'App not installed for this shop' }, 401);
+  }
+
+  // Fetch freshest info from Shopify.
+  const info = await getShopInfo({
+    shop,
+    accessToken: shopRow.access_token,
+    apiVersion: c.env.SHOPIFY_API_VERSION,
   });
-
-  // 2) Preflight: can we fetch the verification file over HTTPS from the domain?
-  const key = c.env.APPLE_VERIFICATION_KV_KEY || 'applepay:partner-verification-file';
-  const expectedFile = await c.env.APPLEPAY_KV.get(key);
-  if (!expectedFile) {
-    return json({ ok: false, error: 'Verification file missing from KV.' }, { status: 500 });
+  const domain = (info.primaryDomainHost || '').trim();
+  if (!domain || domain.endsWith('.myshopify.com')) {
+    return c.json({ error: 'A custom primary domain is required (not *.myshopify.com)' }, 400);
   }
 
-  let verificationOk = false;
+  // Ensure Cloudflare Custom Hostname exists for this domain.
+  let ch = null as Awaited<ReturnType<typeof findCustomHostname>>;
   try {
-    const res = await fetch(`https://${domain}/.well-known/apple-developer-merchantid-domain-association`, {
-      redirect: 'manual',
+    const existing = await findCustomHostname({
+      apiToken: c.env.CF_API_TOKEN,
+      zoneId: c.env.CF_ZONE_ID,
+      hostname: domain,
     });
-    const textBody = await res.text();
-    verificationOk = res.ok && textBody.trim() === expectedFile.trim();
-  } catch {
-    verificationOk = false;
+
+    ch = existing;
+
+    // Ensure the hostname routes to the correct Shopify origin (per-hostname).
+    // This keeps regular storefront traffic working while we only intercept the
+    // Apple Pay well-known file and /applepay/session.
+    if (ch && (ch.custom_origin_server !== shop || ch.custom_origin_sni !== shop)) {
+      ch = await editCustomHostname({
+        apiToken: c.env.CF_API_TOKEN,
+        zoneId: c.env.CF_ZONE_ID,
+        customHostnameId: ch.id,
+        customOriginServer: shop,
+        customOriginSni: shop,
+        customMetadata: {
+          shop,
+          shop_id: shopRow.shop_id,
+        },
+      });
+    }
+
+    if (!ch) {
+      ch = await createCustomHostname({
+        apiToken: c.env.CF_API_TOKEN,
+        zoneId: c.env.CF_ZONE_ID,
+        hostname: domain,
+        customOriginServer: shop,
+        customOriginSni: shop,
+        customMetadata: {
+          shop,
+          shop_id: shopRow.shop_id,
+        },
+      });
+    }
+  } catch (e: any) {
+    const dnsInstructions = dnsInstructionsFor(domain, c.env.CF_SAAS_CNAME_TARGET);
+    await upsertMerchantDomain(c.env.DB, {
+      shop,
+      shopId: shopRow.shop_id,
+      domain,
+      partnerInternalMerchantIdentifier: shopRow.shop_id,
+      partnerMerchantName: info.name,
+      encryptTo: c.env.APPLE_ENCRYPT_TO,
+      environment: c.env.APPLE_ENV,
+      status: 'DNS_NOT_CONFIGURED',
+      lastError: e?.message || String(e),
+      cloudflareHostnameId: null,
+      cloudflareHostnameStatus: null,
+      cloudflareSslStatus: null,
+      appleLastCheckedAt: null,
+    });
+
+    return c.json(toApplePayStatus(await getMerchantDomainByShop(c.env.DB, shop), dnsInstructions), 200, {
+      ...noStoreHeaders(),
+    });
   }
 
-  // Save/Upsert merchant domain row
-  const partnerInternalMerchantIdentifier = info.id; // stable Shopify Shop GID
-  const partnerMerchantName = info.name;
+  const cfHostStatus = ch.status || null;
+  const cfSslStatus = ch.ssl?.status || null;
 
+  // Persist/refresh our merchant domain record.
   await upsertMerchantDomain(c.env.DB, {
     shop,
-    shopId: info.id,
+    shopId: shopRow.shop_id,
     domain,
-    partnerInternalMerchantIdentifier,
-    partnerMerchantName,
+    partnerInternalMerchantIdentifier: shopRow.shop_id,
+    partnerMerchantName: info.name,
     encryptTo: c.env.APPLE_ENCRYPT_TO,
     environment: c.env.APPLE_ENV,
-    status: verificationOk ? 'PENDING' : 'DNS_NOT_CONFIGURED',
-    cloudflareHostnameId: cf.id,
-    cloudflareHostnameStatus: cf.status,
-    cloudflareSslStatus: cf.ssl?.status ?? null,
-    lastError: verificationOk ? null : 'Verification file not accessible yet. Update DNS and wait for SSL to be active.',
+    status: 'DNS_NOT_CONFIGURED',
+    lastError: null,
+    cloudflareHostnameId: ch.id,
+    cloudflareHostnameStatus: cfHostStatus,
+    cloudflareSslStatus: cfSslStatus,
+    appleLastCheckedAt: null,
   });
 
-  if (!verificationOk) {
-    return json({
-      ok: true,
-      step: 'dns',
-      message: 'DNS is not pointing to Cloudflare yet (or SSL not active). Configure DNS and retry.',
+  // Preflight: verify the merchant domain is already serving the partner verification file.
+  const expectedFile = await getPartnerVerificationFile(c.env);
+  const preflight = await preflightVerificationFile(domain, expectedFile);
+  if (!preflight.ok) {
+    const dnsInstructions = dnsInstructionsFor(domain, c.env.CF_SAAS_CNAME_TARGET);
+
+    await updateMerchantDomainCloudflareStatus(c.env.DB, {
       domain,
-      dns: {
-        type: domain.split('.').length === 2 ? 'ALIAS/CNAME (apex)' : 'CNAME',
-        name: domain,
-        target: c.env.CF_SAAS_CNAME_TARGET,
-      },
-      cloudflare: {
-        customHostnameId: cf.id,
-        status: cf.status,
-        sslStatus: cf.ssl?.status ?? null,
-        validationRecords: cf.ssl?.validation_records ?? [],
-      },
+      cloudflareHostnameId: ch.id,
+      cloudflareHostnameStatus: cfHostStatus,
+      cloudflareSslStatus: cfSslStatus,
+      lastError: preflight.reason || 'Domain not serving verification file yet',
     });
+    await updateMerchantDomainAppleStatus(c.env.DB, {
+      domain,
+      status: 'DNS_NOT_CONFIGURED',
+      lastError: preflight.reason || 'Domain not serving verification file yet',
+      appleLastCheckedAt: nowIso(),
+    });
+
+    const md = await getMerchantDomainByShop(c.env.DB, shop);
+    return c.json(toApplePayStatus(md, dnsInstructions), 200, { ...noStoreHeaders() });
   }
 
-  // 3) Call Apple registerMerchant
+  // Apple requires the file in place BEFORE registerMerchant.
+  // Now that preflight succeeded, we can register the merchant.
   try {
-    await registerMerchant(c.env, {
-      domainNames: [domain],
-      partnerInternalMerchantIdentifier,
-      partnerMerchantName,
+    await registerMerchant({
+      fetcher: c.env.APPLE_MTLS,
+      appleEnv: c.env.APPLE_ENV,
+      domain,
       encryptTo: c.env.APPLE_ENCRYPT_TO,
+      partnerInternalMerchantIdentifier: shopRow.shop_id,
+      partnerMerchantName: info.name,
+      useJwt: c.env.APPLE_USE_JWT === 'true',
+      issuer: c.env.APPLE_ENCRYPT_TO,
+      certificatePem: c.env.APPLE_JWT_CERT_PEM,
+      privateKeyPem: c.env.APPLE_JWT_PRIVATE_KEY_PEM,
     });
-  } catch (e: any) {
+
     await updateMerchantDomainAppleStatus(c.env.DB, {
-      shop,
       domain,
-      status: 'ERROR',
-      lastError: `Apple registerMerchant failed: ${e?.message ?? String(e)}`,
-      appleLastCheckedAt: nowIso(),
-    });
-    return json({ ok: false, error: `Apple registerMerchant failed: ${e?.message ?? String(e)}` }, { status: 502 });
-  }
-
-  // 4) Fetch merchant details once (best-effort)
-  let details: any = null;
-  try {
-    details = await getMerchantDetails(c.env, partnerInternalMerchantIdentifier);
-    // Some docs use fields like status/domainNames etc.
-  } catch {
-    details = null;
-  }
-
-  await updateMerchantDomainAppleStatus(c.env.DB, {
-    shop,
-    domain,
-    status: 'PENDING',
-    lastError: null,
-    appleLastCheckedAt: nowIso(),
-  });
-
-  return json({
-    ok: true,
-    step: 'apple',
-    message: 'Merchant registration submitted to Apple. Apple will verify the domain by fetching the /.well-known file.',
-    domain,
-    merchantIdentifier: partnerInternalMerchantIdentifier,
-    appleDetails: details,
-    appleBaseUrl: getApplePayBaseUrl(c.env.APPLE_ENV),
-  });
-});
-
-app.post('/api/applepay/check', async (c) => {
-  const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return json({ ok: false, error: 'Not found' }, { status: 404 });
-
-  const payload = await requireSession(c);
-  if (!payload || payload instanceof Response) return payload;
-  const shop = normalizeDomain(new URL(payload.dest).hostname);
-
-  const row = await getMerchantDomainByShop(c.env.DB, shop);
-  if (!row) return json({ ok: false, error: 'No merchant onboarded yet.' }, { status: 404 });
-
-  let details: any;
-  try {
-    details = await getMerchantDetails(c.env, row.partner_internal_merchant_identifier);
-  } catch (e: any) {
-    await updateMerchantDomainAppleStatus(c.env.DB, {
-      shop,
-      domain: row.domain,
-      status: 'ERROR',
-      lastError: `Apple getMerchantDetails failed: ${e?.message ?? String(e)}`,
-      appleLastCheckedAt: nowIso(),
-    });
-    return json({ ok: false, error: `Apple getMerchantDetails failed: ${e?.message ?? String(e)}` }, { status: 502 });
-  }
-
-  // Very light inference: if details.domains contains VERIFIED, etc. If not present, keep PENDING.
-  let status = row.status;
-  try {
-    const possibleStatus = (details?.status || details?.merchantStatus || '').toString().toUpperCase();
-    if (possibleStatus) status = possibleStatus;
-  } catch {
-    // ignore
-  }
-
-  await updateMerchantDomainAppleStatus(c.env.DB, {
-    shop,
-    domain: row.domain,
-    status: status === 'VERIFIED' ? 'VERIFIED' : 'PENDING',
-    lastError: null,
-    appleLastCheckedAt: nowIso(),
-  });
-
-  return json({ ok: true, appleDetails: details });
-});
-
-app.post('/api/applepay/unregister', async (c) => {
-  const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return json({ ok: false, error: 'Not found' }, { status: 404 });
-
-  const payload = await requireSession(c);
-  if (!payload || payload instanceof Response) return payload;
-  const shop = normalizeDomain(new URL(payload.dest).hostname);
-
-  const row = await getMerchantDomainByShop(c.env.DB, shop);
-  if (!row) return json({ ok: false, error: 'No merchant onboarded yet.' }, { status: 404 });
-
-  try {
-    await unregisterMerchant(c.env, {
-      partnerInternalMerchantIdentifier: row.partner_internal_merchant_identifier,
-      domainNames: [row.domain],
-    });
-  } catch (e: any) {
-    return json({ ok: false, error: `Apple unregisterMerchant failed: ${e?.message ?? String(e)}` }, { status: 502 });
-  }
-
-  // Delete Cloudflare custom hostname (best-effort)
-  if (row.cloudflare_custom_hostname_id) {
-    try {
-      await deleteCustomHostname(c.env, row.cloudflare_custom_hostname_id);
-    } catch {
-      // ignore
-    }
-  }
-
-  await updateMerchantDomainAppleStatus(c.env.DB, {
-    shop,
-    domain: row.domain,
-    status: 'UNREGISTERED',
-    lastError: null,
-    appleLastCheckedAt: nowIso(),
-  });
-
-  return json({ ok: true, message: 'Unregistered from Apple and deleted Cloudflare hostname (if any).' });
-});
-
-// --- Shopify webhook: APP_UNINSTALLED ---
-app.post('/webhooks/shopify/app-uninstalled', async (c) => {
-  const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return json({ ok: false, error: 'Not found' }, { status: 404 });
-
-  const rawBody = await c.req.text();
-  const hmac = c.req.header('X-Shopify-Hmac-Sha256') ?? '';
-  const shop = (c.req.header('X-Shopify-Shop-Domain') ?? '').toLowerCase();
-
-  // Verify HMAC (base64) for webhooks
-  const computed = await (async () => {
-    const key = new TextEncoder().encode(c.env.SHOPIFY_API_SECRET);
-    const msg = new TextEncoder().encode(rawBody);
-    const cryptoKey = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    const sig = await crypto.subtle.sign('HMAC', cryptoKey, msg);
-    const bytes = new Uint8Array(sig);
-    let binary = '';
-    for (const b of bytes) binary += String.fromCharCode(b);
-    return btoa(binary);
-  })();
-
-  if (computed !== hmac) {
-    await logWebhookEvent(c.env.DB, {
-      eventType: 'shopify.app_uninstalled',
-      shop,
-      payload: rawBody,
-      receivedAt: nowIso(),
-      processedAt: nowIso(),
-      status: 'invalid_hmac',
-    });
-    return json({ ok: false, error: 'Invalid webhook HMAC' }, { status: 401 });
-  }
-
-  await logWebhookEvent(c.env.DB, {
-    eventType: 'shopify.app_uninstalled',
-    shop,
-    payload: rawBody,
-    receivedAt: nowIso(),
-    processedAt: nowIso(),
-    status: 'ok',
-  });
-
-  await markShopUninstalled(c.env.DB, shop, nowIso());
-
-  // Optionally unregister from Apple & delete hostname
-  const merchant = await getMerchantDomainByShop(c.env.DB, shop);
-  if (merchant) {
-    try {
-      await unregisterMerchant(c.env, {
-        partnerInternalMerchantIdentifier: merchant.partner_internal_merchant_identifier,
-        domainNames: [merchant.domain],
-      });
-    } catch {
-      // ignore
-    }
-
-    if (merchant.cloudflare_custom_hostname_id) {
-      try {
-        await deleteCustomHostname(c.env, merchant.cloudflare_custom_hostname_id);
-      } catch {
-        // ignore
-      }
-    }
-
-    await updateMerchantDomainAppleStatus(c.env.DB, {
-      shop,
-      domain: merchant.domain,
-      status: 'UNREGISTERED',
+      status: 'VERIFIED',
       lastError: null,
       appleLastCheckedAt: nowIso(),
     });
+  } catch (e: any) {
+    await updateMerchantDomainAppleStatus(c.env.DB, {
+      domain,
+      status: 'ERROR',
+      lastError: e?.message || String(e),
+      appleLastCheckedAt: nowIso(),
+    });
   }
 
-  return json({ ok: true });
+  const md = await getMerchantDomainByShop(c.env.DB, shop);
+  return c.json(toApplePayStatus(md), 200, { ...noStoreHeaders() });
 });
 
-// --- Asset / pass-through fallback ---
-app.all('*', async (c) => {
-  const url = new URL(c.req.url);
-  const env = c.env;
+// Session-authenticated API: check merchant details (debug)
+app.post('/api/applepay/check', async (c) => {
+  const u = new URL(c.req.url);
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
-  // If request is for the app host, serve UI assets.
-  if (isAppHost(env, url)) {
-    // Allow Shopify admin to iframe the app
-    const frameAncestors = [
-      `https://${url.searchParams.get('shop') ?? '*.myshopify.com'}`,
-      'https://admin.shopify.com',
-      'https://*.myshopify.com',
-    ];
+  const payload = await requireShopifySession(c);
+  if (payload instanceof Response) return payload;
 
-    const res = await env.ASSETS.fetch(c.req.raw);
-
-    const headers = new Headers(res.headers);
-    headers.set('Content-Security-Policy', `frame-ancestors ${frameAncestors.join(' ')};`);
-    headers.set('X-Content-Type-Options', 'nosniff');
-    headers.set('Referrer-Policy', 'no-referrer');
-
-    // Force index.html for SPA routes if asset missing
-    if (res.status === 404) {
-      const indexReq = new Request(new URL('/index.html', env.SHOPIFY_APP_URL).toString());
-      const indexRes = await env.ASSETS.fetch(indexReq);
-      const h2 = new Headers(indexRes.headers);
-      h2.set('Content-Security-Policy', `frame-ancestors ${frameAncestors.join(' ')};`);
-      h2.set('X-Content-Type-Options', 'nosniff');
-      h2.set('Referrer-Policy', 'no-referrer');
-      return new Response(indexRes.body, { status: indexRes.status, headers: h2 });
-    }
-
-    return new Response(res.body, { status: res.status, headers });
+  const shop = shopFromDest(payload.dest);
+  const shopRow = await getShopByShop(c.env.DB, shop);
+  if (!shopRow || shopRow.uninstalled_at) {
+    return c.json({ error: 'App not installed for this shop' }, 401);
   }
 
-  // For merchant hostnames, pass-through to origin (Shopify) for everything else.
-  return fetch(c.req.raw);
-});
+  const md = await getMerchantDomainByShop(c.env.DB, shop);
+  if (!md) return c.json(toApplePayStatus(null), 200, { ...noStoreHeaders() });
 
-export default {
-  fetch: app.fetch,
-  scheduled: async (event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
-    // Daily re-check pending merchants
-    ctx.waitUntil(
-      (async () => {
-        const rows = await env.DB.prepare(
-          "SELECT shop, domain, partner_internal_merchant_identifier FROM merchant_domains WHERE status IN ('PENDING','DNS_NOT_CONFIGURED')"
-        ).all();
-
-        for (const r of rows.results as any[]) {
-          try {
-            const details = await getMerchantDetails(env, r.partner_internal_merchant_identifier);
-            const possibleStatus = (details?.status || details?.merchantStatus || '').toString().toUpperCase();
-            const nextStatus = possibleStatus === 'VERIFIED' ? 'VERIFIED' : 'PENDING';
-            await updateMerchantDomainAppleStatus(env.DB, {
-              shop: r.shop,
-              domain: r.domain,
-              status: nextStatus,
-              lastError: null,
-              appleLastCheckedAt: nowIso(),
-            });
-          } catch (e: any) {
-            await updateMerchantDomainAppleStatus(env.DB, {
-              shop: r.shop,
-              domain: r.domain,
-              status: 'ERROR',
-              lastError: `Cron check failed: ${e?.message ?? String(e)}`,
-              appleLastCheckedAt: nowIso(),
-            });
-          }
-        }
-      })()
+  try {
+    const details = await getMerchantDetails({
+      fetcher: c.env.APPLE_MTLS,
+      appleEnv: c.env.APPLE_ENV,
+      merchantIdentifier: md.partner_internal_merchant_identifier,
+      useJwt: c.env.APPLE_USE_JWT === 'true',
+      issuer: c.env.APPLE_ENCRYPT_TO,
+      certificatePem: c.env.APPLE_JWT_CERT_PEM,
+      privateKeyPem: c.env.APPLE_JWT_PRIVATE_KEY_PEM,
+    });
+    // We don’t have a formal status field; treat successful fetch as healthy.
+    await updateMerchantDomainAppleStatus(c.env.DB, {
+      domain: md.domain,
+      status: md.status,
+      lastError: null,
+      appleLastCheckedAt: nowIso(),
+    });
+    return c.json(
+      {
+        ...toApplePayStatus(await getMerchantDomainByShop(c.env.DB, shop)),
+        details,
+      },
+      200,
+      { ...noStoreHeaders() },
     );
-  },
-};
+  } catch (e: any) {
+    await updateMerchantDomainAppleStatus(c.env.DB, {
+      domain: md.domain,
+      status: 'ERROR',
+      lastError: e?.message || String(e),
+      appleLastCheckedAt: nowIso(),
+    });
+    return c.json(toApplePayStatus(await getMerchantDomainByShop(c.env.DB, shop)), 200, { ...noStoreHeaders() });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Static assets (admin UI)
+// -----------------------------------------------------------------------------
+
+app.all('*', async (c) => {
+  const u = new URL(c.req.url);
+
+  // ---------------------------------------------------------------------------
+  // Merchant domain traffic (custom hostnames)
+  // ---------------------------------------------------------------------------
+  // For merchant storefront traffic we ONLY intercept Apple Pay-specific routes
+  // (handled above). Everything else should pass through to the per-hostname
+  // custom origin configured in Cloudflare for SaaS (custom_origin_server).
+  if (!isAppHost(c.env, u)) {
+    return fetch(c.req.raw);
+  }
+
+  // ---------------------------------------------------------------------------
+  // App host traffic (embedded admin UI)
+  // ---------------------------------------------------------------------------
+  if (c.req.method !== 'GET') {
+    return c.text('Not Found', 404);
+  }
+
+  // Install gate: if this shop hasn't completed OAuth (or the DB was reset),
+  // bounce into /auth at the TOP LEVEL (not within the iframe).
+  const accept = c.req.header('accept') ?? '';
+  if (accept.includes('text/html')) {
+    const shopParam = u.searchParams.get('shop');
+    const hostParam = u.searchParams.get('host');
+    if (shopParam && hostParam) {
+      const shop = normalizeShopParam(shopParam);
+      if (isValidShopDomain(shop)) {
+        const existing = await getShopByShop(c.env.DB, shop);
+        if (!existing) {
+          const authUrl = new URL('/auth', c.env.SHOPIFY_APP_URL);
+          authUrl.searchParams.set('shop', shop);
+          authUrl.searchParams.set('host', hostParam);
+
+          return c.html(oauthBounceHtml(authUrl.toString()), 200, {
+            ...cspHeaders(),
+            ...noStoreHeaders(),
+          });
+        }
+      }
+    }
+  }
+
+  const res = await c.env.ASSETS.fetch(c.req.raw);
+  const headers = new Headers(res.headers);
+  Object.entries(cspHeaders()).forEach(([k, v]) => headers.set(k, v));
+  Object.entries(noStoreHeaders()).forEach(([k, v]) => headers.set(k, v));
+  return new Response(res.body, { status: res.status, headers });
+});
+
+export default app;
