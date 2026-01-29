@@ -23,7 +23,6 @@ import {
 import {
   createCustomHostname,
   deleteCustomHostname,
-  editCustomHostname,
   findCustomHostname,
 } from './lib/cloudflare';
 import {
@@ -260,6 +259,52 @@ function dnsInstructionsFor(domain: string, target: string): DnsInstructionsApi 
       'If your DNS provider does not allow CNAME at the apex (root), use an ALIAS/ANAME (or CNAME flattening if using Cloudflare DNS). After DNS propagates, click “Refresh” in this app.',
   };
 }
+
+async function proxyMerchantTrafficToShopify(c: any, u: URL): Promise<Response> {
+  const host = u.hostname;
+
+  // Lookup by exact hostname; also try stripping/adding "www.".
+  const row =
+    (await getMerchantDomainByDomain(c.env.DB, host)) ||
+    (host.startsWith('www.')
+      ? await getMerchantDomainByDomain(c.env.DB, host.slice(4))
+      : await getMerchantDomainByDomain(c.env.DB, `www.${host}`));
+
+  // If we don't recognize the hostname, just fall back to the default fetch.
+  if (!row) {
+    return fetch(c.req.raw);
+  }
+
+  // Proxy to Shopify but preserve the original Host header so Shopify routes
+  // the request as a custom domain storefront.
+  const originUrl = new URL(c.req.url);
+  originUrl.protocol = 'https:';
+  originUrl.hostname = row.shop;
+  originUrl.port = '';
+
+  const headers = new Headers(c.req.raw.headers);
+  headers.set('host', host);
+  headers.set('x-forwarded-host', host);
+  headers.set('x-forwarded-proto', 'https');
+  headers.set('x-forwarded-ssl', 'on'); // <-- ADDED THIS LINE
+
+  const ip = headers.get('cf-connecting-ip');
+  if (ip) headers.set('x-forwarded-for', ip);
+
+  // Avoid mismatched content-length on streamed bodies.
+  headers.delete('content-length');
+
+  const method = c.req.method.toUpperCase();
+  const body = method === 'GET' || method === 'HEAD' ? undefined : (c.req.raw.body as any);
+
+  return fetch(originUrl.toString(), {
+    method,
+    headers,
+    body,
+    redirect: 'manual',
+  });
+}
+
 
 // -----------------------------------------------------------------------------
 // Public (merchant-domain) routes
@@ -631,47 +676,28 @@ app.post('/api/applepay/onboard', async (c) => {
   }
 
   // Ensure Cloudflare Custom Hostname exists for this domain.
-  let ch = null as Awaited<ReturnType<typeof findCustomHostname>>;
-  try {
-    const existing = await findCustomHostname({
+let ch = null as Awaited<ReturnType<typeof findCustomHostname>>;
+try {
+  const existing = await findCustomHostname({
+    apiToken: c.env.CF_API_TOKEN,
+    zoneId: c.env.CF_ZONE_ID,
+    hostname: domain,
+  });
+
+  ch = existing;
+
+  if (!ch) {
+    ch = await createCustomHostname({
       apiToken: c.env.CF_API_TOKEN,
       zoneId: c.env.CF_ZONE_ID,
       hostname: domain,
+      customMetadata: {
+        shop,
+        shop_id: shopRow.shop_id,
+      },
     });
-
-    ch = existing;
-
-    // Ensure the hostname routes to the correct Shopify origin (per-hostname).
-    // This keeps regular storefront traffic working while we only intercept the
-    // Apple Pay well-known file and /applepay/session.
-    if (ch && (ch.custom_origin_server !== shop || ch.custom_origin_sni !== shop)) {
-      ch = await editCustomHostname({
-        apiToken: c.env.CF_API_TOKEN,
-        zoneId: c.env.CF_ZONE_ID,
-        customHostnameId: ch.id,
-        customOriginServer: shop,
-        customOriginSni: shop,
-        customMetadata: {
-          shop,
-          shop_id: shopRow.shop_id,
-        },
-      });
-    }
-
-    if (!ch) {
-      ch = await createCustomHostname({
-        apiToken: c.env.CF_API_TOKEN,
-        zoneId: c.env.CF_ZONE_ID,
-        hostname: domain,
-        customOriginServer: shop,
-        customOriginSni: shop,
-        customMetadata: {
-          shop,
-          shop_id: shopRow.shop_id,
-        },
-      });
-    }
-  } catch (e: any) {
+  }
+} catch (e: any) {
     const dnsInstructions = dnsInstructionsFor(domain, c.env.CF_SAAS_CNAME_TARGET);
     await upsertMerchantDomain(c.env.DB, {
       shop,
@@ -839,9 +865,10 @@ app.all('*', async (c) => {
   // For merchant storefront traffic we ONLY intercept Apple Pay-specific routes
   // (handled above). Everything else should pass through to the per-hostname
   // custom origin configured in Cloudflare for SaaS (custom_origin_server).
-  if (!isAppHost(c.env, u)) {
-    return fetch(c.req.raw);
-  }
+if (!isAppHost(c.env, u)) {
+  return proxyMerchantTrafficToShopify(c, u);
+}
+
 
   // ---------------------------------------------------------------------------
   // App host traffic (embedded admin UI)
@@ -881,4 +908,13 @@ app.all('*', async (c) => {
   return new Response(res.body, { status: res.status, headers });
 });
 
-export default app;
+export default {
+  // 1. Pass web requests to your existing Hono app
+  fetch: app.fetch,
+
+  // 2. Add the missing Scheduled handler for Cron triggers
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    console.log("Cron trigger fired");
+    // Add any scheduled logic here if needed
+  },
+};

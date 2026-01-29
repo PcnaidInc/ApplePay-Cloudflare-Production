@@ -3,6 +3,7 @@
   "name": "applepay-control-plane",
   "main": "src/index.ts",
   "compatibility_date": "2026-01-13",
+  "workers_dev": true, // <-- ADD THIS LINE
   "assets": {
     "directory": "../admin-ui/dist",
     "binding": "ASSETS"
@@ -39,13 +40,23 @@
     "SHOPIFY_SCOPES": "read_content,read_themes,write_online_store_navigation",
     "APPLE_ENV": "production",
     "APPLE_USE_JWT": "true",
-    "CF_ZONE_ID": "466bdf66d7498a2167140d334df52787",
-    "CF_SAAS_CNAME_TARGET": "dcv.pcnaid.com",
+    "CF_ZONE_ID": "7f7fd94a0d08b3add0d085f41b37ac36",
+    "CF_SAAS_CNAME_TARGET": "fallback.pcnaid-edge.com",
     "APPLE_VERIFICATION_KV_KEY": "applepay:partner-verification-file",
     "APPLE_ENCRYPT_TO": "platformintegrator.com.pcnaid.shopifyverifier",
     "SHOPIFY_APP_URL": "https://applepay-control-plane.pcnaid.workers.dev"
   },
   "triggers": {
     "crons": ["0 * * * *"]
-  }
+  },
+  "routes": [
+  // 1. RUN the worker ONLY for the Apple Pay file
+  {
+    "pattern": "*/.well-known/apple-developer-merchantid-domain-association",
+    "zone_name": "pcnaid-edge.com" // Optional, if you can bind to the zone
+  },
+  // 2. Do NOT run the worker for anything else. 
+  // By NOT adding a route for "*.pcnaid.com/*", standard traffic bypasses the worker 
+  // and flows directly to Shopify via your CNAME record.
+]
 }

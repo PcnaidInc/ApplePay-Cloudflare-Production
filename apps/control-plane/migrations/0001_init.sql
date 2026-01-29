@@ -42,5 +42,8 @@ CREATE TABLE IF NOT EXISTS webhook_events (
   topic TEXT NOT NULL,
   webhook_id TEXT,
   payload TEXT NOT NULL,
-  received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  processed_at TEXT,
+  status TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
