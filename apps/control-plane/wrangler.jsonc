@@ -41,6 +41,7 @@
     "APPLE_ENV": "production",
     "APPLE_USE_JWT": "true",
     "CF_ZONE_ID": "7f7fd94a0d08b3add0d085f41b37ac36",
+    "CF_ACCOUNT_ID": "82684ace8215d30a8156c5a8dc5edb1a",
     "CF_SAAS_CNAME_TARGET": "fallback.pcnaid-edge.com",
     "APPLE_VERIFICATION_KV_KEY": "applepay:partner-verification-file",
     "APPLE_ENCRYPT_TO": "platformintegrator.com.pcnaid.shopifyverifier",

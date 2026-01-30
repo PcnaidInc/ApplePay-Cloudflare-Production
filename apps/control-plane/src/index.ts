@@ -913,7 +913,8 @@ export default {
   fetch: app.fetch,
 
   // 2. Add the missing Scheduled handler for Cron triggers
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+  scheduled: (_event: ScheduledEvent, _env: Env, _ctx: ExecutionContext) => {
+    // no-op: prevents cron trigger exceptions
     console.log("Cron trigger fired");
     // Add any scheduled logic here if needed
   },
