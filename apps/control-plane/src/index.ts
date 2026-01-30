@@ -350,7 +350,8 @@ app.post(
       return c.json({ error: `Domain not verified/registered yet: ${row.domain}` }, 409);
     }
 
-    const initiativeContext = `https://${host}`;
+    const initiativeContext = host;
+
     const merchantIdentifier = row.partner_internal_merchant_identifier;
 
     const session = await createPaymentSession({
