@@ -28,6 +28,9 @@ export type MerchantDomainRow = {
   cloudflare_hostname_id: string | null;
   cloudflare_hostname_status: string | null;
   cloudflare_ssl_status: string | null;
+
+  created_at: string | null;
+  updated_at: string | null;
 };
 
 export type WebhookEventRow = {
@@ -173,6 +176,14 @@ export async function getMerchantDomainByShop(db: D1Database, shop: string): Pro
     .bind(shop)
     .first<MerchantDomainRow>();
   return row ?? null;
+}
+
+export async function getMerchantDomainsByShop(db: D1Database, shop: string): Promise<MerchantDomainRow[]> {
+  const result = await db
+    .prepare(`SELECT * FROM merchant_domains WHERE shop=? ORDER BY updated_at DESC`)
+    .bind(shop)
+    .all<MerchantDomainRow>();
+  return result.results ?? [];
 }
 
 export async function getMerchantDomainByDomain(db: D1Database, domain: string): Promise<MerchantDomainRow | null> {

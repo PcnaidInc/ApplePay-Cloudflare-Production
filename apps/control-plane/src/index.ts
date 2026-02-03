@@ -28,6 +28,7 @@ import {
 import {
   getMerchantDomainByDomain,
   getMerchantDomainByShop,
+  getMerchantDomainsByShop,
   getShopByShop,
   logWebhookEvent,
   markShopUninstalled,
@@ -134,6 +135,33 @@ type ApplePayStatusApi = {
   appleMerchantId: string | null;
 };
 
+type DomainListItemApi = {
+  domain: string;
+  status: 'NOT_STARTED' | 'DNS_NOT_CONFIGURED' | 'PENDING' | 'IN_PROCESS' | 'VERIFIED' | 'ERROR' | 'UNREGISTERED';
+  lastError: string | null;
+  cloudflareHostnameStatus: string | null;
+  cloudflareSslStatus: string | null;
+  appleMerchantId: string | null;
+  lastCheckedAt: string | null;
+  createdAt: string;
+};
+
+type DomainDetailsApi = DomainListItemApi & {
+  dnsInstructions: DnsInstructionsApi;
+  registrarInfo: {
+    registrar: string | null;
+    supported: boolean;
+  } | null;
+  cloudflareHostnameId: string | null;
+};
+
+type DomainScanResultApi = {
+  registrar: string | null;
+  supported: boolean;
+  domainConnectUrl: string | null;
+};
+
+
 // -----------------------------------------------------------------------------
 // App
 // -----------------------------------------------------------------------------
@@ -229,6 +257,63 @@ function toApplePayStatus(row: MerchantDomainRow | null, dnsInstructions: DnsIns
     appleMerchantId: row.partner_internal_merchant_identifier,
   };
 }
+
+function toDomainListItem(row: MerchantDomainRow): DomainListItemApi {
+  // Map status to include 'IN_PROCESS' for UI clarity
+  let status: DomainListItemApi['status'] = (row.status as DomainListItemApi['status']) ?? 'NOT_STARTED';
+  if (status === 'PENDING') {
+    status = 'IN_PROCESS';
+  }
+  
+  return {
+    domain: row.domain,
+    status,
+    lastError: row.last_error,
+    cloudflareHostnameStatus: row.cloudflare_hostname_status,
+    cloudflareSslStatus: row.cloudflare_ssl_status,
+    appleMerchantId: row.partner_internal_merchant_identifier,
+    lastCheckedAt: row.apple_last_checked_at,
+    createdAt: row.created_at ?? '',
+  };
+}
+
+function toDomainDetails(row: MerchantDomainRow, cnameTarget: string): DomainDetailsApi {
+  return {
+    ...toDomainListItem(row),
+    dnsInstructions: dnsInstructionsFor(row.domain, cnameTarget),
+    registrarInfo: null, // Will be populated if we have scan results
+    cloudflareHostnameId: row.cloudflare_hostname_id,
+  };
+}
+
+async function detectRegistrar(domain: string): Promise<DomainScanResultApi> {
+  // Stub implementation for registrar detection
+  // In a real implementation, this would query WHOIS or DNS records
+  // For now, we'll return a basic response indicating no Domain Connect support
+  
+  try {
+    // Try to detect common registrars based on nameservers
+    const nameservers: string[] = [];
+    // DNS lookup would go here in a real implementation
+    
+    // Check for Domain Connect support
+    // Domain Connect providers typically have a _domainconnect TXT record
+    const domainConnectUrl = null; // Would be constructed based on actual Domain Connect API
+    
+    return {
+      registrar: null,
+      supported: false,
+      domainConnectUrl: null,
+    };
+  } catch (e: any) {
+    return {
+      registrar: null,
+      supported: false,
+      domainConnectUrl: null,
+    };
+  }
+}
+
 
 async function preflightVerificationFile(domain: string, expectedFile: string): Promise<{ ok: boolean; reason?: string }> {
   const url = `https://${domain}${WELL_KNOWN_PATH}`;
@@ -851,6 +936,207 @@ app.post('/api/applepay/check', async (c) => {
     });
     return c.json(toApplePayStatus(await getMerchantDomainByShop(c.env.DB, shop)), 200, { ...noStoreHeaders() });
   }
+});
+
+// Session-authenticated API: list all domains for a shop
+app.get('/api/domains', async (c) => {
+  const u = new URL(c.req.url);
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
+
+  const payload = await requireShopifySession(c);
+  if (payload instanceof Response) return payload;
+
+  const shop = shopFromDest(payload.dest);
+  const shopRow = await getShopByShop(c.env.DB, shop);
+  if (!shopRow || shopRow.uninstalled_at) {
+    return c.json({ error: 'App not installed for this shop' }, 401);
+  }
+
+  const domains = await getMerchantDomainsByShop(c.env.DB, shop);
+  const result = domains.map(toDomainListItem);
+
+  return c.json({ domains: result }, 200, { ...noStoreHeaders() });
+});
+
+// Session-authenticated API: scan domain for registrar and Domain Connect support
+app.post('/api/domains/scan', async (c) => {
+  const u = new URL(c.req.url);
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
+
+  const payload = await requireShopifySession(c);
+  if (payload instanceof Response) return payload;
+
+  const shop = shopFromDest(payload.dest);
+  const shopRow = await getShopByShop(c.env.DB, shop);
+  if (!shopRow || shopRow.uninstalled_at) {
+    return c.json({ error: 'App not installed for this shop' }, 401);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const domain = (body.domain ?? '').trim().toLowerCase();
+  
+  if (!domain) {
+    return c.json({ error: 'Domain is required' }, 400);
+  }
+
+  const scanResult = await detectRegistrar(domain);
+  return c.json(scanResult, 200, { ...noStoreHeaders() });
+});
+
+// Session-authenticated API: onboard a new domain
+app.post('/api/domains/onboard', async (c) => {
+  const u = new URL(c.req.url);
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
+
+  const payload = await requireShopifySession(c);
+  if (payload instanceof Response) return payload;
+
+  const shop = shopFromDest(payload.dest);
+  const shopRow = await getShopByShop(c.env.DB, shop);
+  if (!shopRow || shopRow.uninstalled_at) {
+    return c.json({ error: 'App not installed for this shop' }, 401);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const domain = (body.domain ?? '').trim().toLowerCase();
+  
+  if (!domain) {
+    return c.json({ error: 'Domain is required' }, 400);
+  }
+
+  if (domain.endsWith('.myshopify.com')) {
+    return c.json({ error: 'Custom domain required (not *.myshopify.com)' }, 400);
+  }
+
+  // Fetch shop info for merchant name
+  const info = await getShopInfo({
+    shop,
+    accessToken: shopRow.access_token,
+    apiVersion: c.env.SHOPIFY_API_VERSION,
+  });
+
+  // Ensure Cloudflare Custom Hostname exists for this domain
+  let ch = null as Awaited<ReturnType<typeof findCustomHostname>>;
+  try {
+    const existing = await findCustomHostname({
+      apiToken: c.env.CF_API_TOKEN,
+      zoneId: c.env.CF_ZONE_ID,
+      hostname: domain,
+    });
+
+    ch = existing;
+
+    if (!ch) {
+      ch = await createCustomHostname({
+        apiToken: c.env.CF_API_TOKEN,
+        zoneId: c.env.CF_ZONE_ID,
+        hostname: domain,
+        customMetadata: {
+          shop,
+          shop_id: shopRow.shop_id,
+        },
+      });
+    }
+  } catch (e: any) {
+    // DNS not configured yet - store the domain record
+    await upsertMerchantDomain(c.env.DB, {
+      shop,
+      shopId: shopRow.shop_id,
+      domain,
+      partnerInternalMerchantIdentifier: shopRow.shop_id,
+      partnerMerchantName: info.name,
+      encryptTo: c.env.APPLE_ENCRYPT_TO,
+      environment: c.env.APPLE_ENV,
+      status: 'DNS_NOT_CONFIGURED',
+      lastError: e?.message || String(e),
+      cloudflareHostnameId: null,
+      cloudflareHostnameStatus: null,
+      cloudflareSslStatus: null,
+      appleLastCheckedAt: null,
+    });
+
+    const md = await getMerchantDomainByDomain(c.env.DB, domain);
+    return c.json(md ? toDomainListItem(md) : null, 200, { ...noStoreHeaders() });
+  }
+
+  const cfHostStatus = ch.status || null;
+  const cfSslStatus = ch.ssl?.status || null;
+
+  // Persist/refresh our merchant domain record with IN_PROCESS status
+  await upsertMerchantDomain(c.env.DB, {
+    shop,
+    shopId: shopRow.shop_id,
+    domain,
+    partnerInternalMerchantIdentifier: shopRow.shop_id,
+    partnerMerchantName: info.name,
+    encryptTo: c.env.APPLE_ENCRYPT_TO,
+    environment: c.env.APPLE_ENV,
+    status: 'PENDING', // Will show as IN_PROCESS in UI
+    lastError: null,
+    cloudflareHostnameId: ch.id,
+    cloudflareHostnameStatus: cfHostStatus,
+    cloudflareSslStatus: cfSslStatus,
+    appleLastCheckedAt: null,
+  });
+
+  // Immediately attempt Apple registration (NO PREFLIGHT CHECKS as per requirements)
+  try {
+    await registerMerchant({
+      fetcher: c.env.APPLE_MTLS,
+      appleEnv: c.env.APPLE_ENV,
+      domain,
+      encryptTo: c.env.APPLE_ENCRYPT_TO,
+      partnerInternalMerchantIdentifier: shopRow.shop_id,
+      partnerMerchantName: info.name,
+      useJwt: c.env.APPLE_USE_JWT === 'true',
+      issuer: c.env.APPLE_ENCRYPT_TO,
+      certificatePem: c.env.APPLE_JWT_CERT_PEM,
+      privateKeyPem: c.env.APPLE_JWT_PRIVATE_KEY_PEM,
+    });
+
+    await updateMerchantDomainAppleStatus(c.env.DB, {
+      domain,
+      status: 'VERIFIED',
+      lastError: null,
+      appleLastCheckedAt: nowIso(),
+    });
+  } catch (e: any) {
+    // If Apple registration fails, update status but don't fail the request
+    await updateMerchantDomainAppleStatus(c.env.DB, {
+      domain,
+      status: 'ERROR',
+      lastError: e?.message || String(e),
+      appleLastCheckedAt: nowIso(),
+    });
+  }
+
+  const md = await getMerchantDomainByDomain(c.env.DB, domain);
+  return c.json(md ? toDomainListItem(md) : null, 200, { ...noStoreHeaders() });
+});
+
+// Session-authenticated API: get detailed info for a domain
+app.get('/api/domains/:domain/details', async (c) => {
+  const u = new URL(c.req.url);
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
+
+  const payload = await requireShopifySession(c);
+  if (payload instanceof Response) return payload;
+
+  const shop = shopFromDest(payload.dest);
+  const shopRow = await getShopByShop(c.env.DB, shop);
+  if (!shopRow || shopRow.uninstalled_at) {
+    return c.json({ error: 'App not installed for this shop' }, 401);
+  }
+
+  const domain = c.req.param('domain');
+  const md = await getMerchantDomainByDomain(c.env.DB, domain);
+
+  if (!md || md.shop !== shop) {
+    return c.json({ error: 'Domain not found' }, 404);
+  }
+
+  const details = toDomainDetails(md, c.env.CF_SAAS_CNAME_TARGET);
+  return c.json(details, 200, { ...noStoreHeaders() });
 });
 
 // -----------------------------------------------------------------------------
