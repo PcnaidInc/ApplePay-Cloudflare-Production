@@ -9,6 +9,9 @@
     "lint": "eslint ."
   },
   "dependencies": {
+    "@datadog/browser-logs": "^6.26.0",
+    "@datadog/browser-rum": "^6.26.0",
+    "@datadog/browser-rum-react": "^6.26.0",
     "@shopify/app-bridge": "3.7.10",
     "@shopify/polaris": "^12.0.0",
     "@shopify/polaris-icons": "^9.0.0",

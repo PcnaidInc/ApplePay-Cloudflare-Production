@@ -3,6 +3,7 @@
   "name": "applepay-control-plane",
   "main": "src/index.ts",
   "compatibility_date": "2026-01-13",
+  "compatibility_flags": ["nodejs_compat"], // <--- ADD THIS LINE
   "workers_dev": true, // <-- ADD THIS LINE
   "assets": {
     "directory": "../admin-ui/dist",
@@ -45,7 +46,9 @@
     "CF_SAAS_CNAME_TARGET": "fallback.pcnaid-edge.com",
     "APPLE_VERIFICATION_KV_KEY": "applepay:partner-verification-file",
     "APPLE_ENCRYPT_TO": "platformintegrator.com.pcnaid.shopifyverifier",
-    "SHOPIFY_APP_URL": "https://applepay-control-plane.pcnaid.workers.dev"
+    "SHOPIFY_APP_URL": "https://applepay-control-plane.pcnaid.workers.dev",
+	"OTEL_SERVICE_NAME": "applepay-control-plane",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.datadoghq.com/v1/traces"
   },
   "triggers": {
     "crons": ["0 * * * *"]

@@ -1,3 +1,6 @@
+import { trace } from '@opentelemetry/api';
+import { instrument, ResolveConfigFn } from '@microlabs/otel-cf-workers';
+
 import { Hono } from 'hono';
 import { setCookie, getCookie, deleteCookie } from 'hono/cookie';
 import { cors } from 'hono/cors';
@@ -38,14 +41,82 @@ import {
   type MerchantDomainRow,
 } from './lib/db';
 import {
+  performOp,
   nowIso,
   randomState,
   sha256Hex,
 } from './lib/util';
 
+
 // -----------------------------------------------------------------------------
 // Types
 // -----------------------------------------------------------------------------
+
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+function safeError(err: unknown): { name?: string; message: string; stack?: string } {
+  if (err instanceof Error) return { name: err.name, message: err.message, stack: err.stack };
+  return { message: String(err) };
+}
+
+function getPathAndHost(reqUrl: string): { host: string; path: string } {
+  try {
+    const u = new URL(reqUrl);
+    return { host: u.host, path: u.pathname };
+  } catch {
+    return { host: 'unknown', path: 'unknown' };
+  }
+}
+
+function logEvent(
+  c: any,
+  level: LogLevel,
+  msg: string,
+  fields: Record<string, unknown> = {},
+) {
+  const requestId = (c.get('requestId') ?? 'unknown') as string;
+  const flowId = (c.get('flowId') ?? requestId) as string;
+  const step = (c.get('step') ?? 0) as number;
+  const { host, path } = getPathAndHost(c.req.url);
+
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    msg,
+    requestId,
+    flowId,
+    step,
+    http: {
+      method: c.req.method,
+      host,
+      path,
+      cfRay: c.req.header('cf-ray') ?? null,
+    },
+    ...fields,
+  };
+
+  const line = JSON.stringify(payload);
+  if (level === 'error') console.error(line);
+  else console.log(line);
+}
+
+async function withStep<T>(c: any, name: string, fn: () => Promise<T>): Promise<T> {
+  const nextStep = ((c.get('step') ?? 0) as number) + 1;
+  c.set('step', nextStep);
+
+  const started = Date.now();
+  logEvent(c, 'info', 'step.start', { stepName: name });
+
+  try {
+    const out = await fn();
+    logEvent(c, 'info', 'step.ok', { stepName: name, durationMs: Date.now() - started });
+    return out;
+  } catch (err) {
+    logEvent(c, 'error', 'step.error', { stepName: name, durationMs: Date.now() - started, error: safeError(err) });
+    throw err;
+  }
+}
+
 
 type Fetcher = {
   fetch(input: URL | RequestInfo, init?: RequestInit): Promise<Response>;
@@ -81,6 +152,11 @@ type Env = {
   APPLE_JWT_CERT_PEM: string;
   APPLE_JWT_PRIVATE_KEY_PEM: string;
   APPLE_VERIFICATION_KV_KEY?: string;
+
+  // OpenTelemetry
+  OTEL_EXPORTER_OTLP_ENDPOINT?: string;
+  OTEL_EXPORTER_OTLP_HEADERS?: string;
+  OTEL_SERVICE_NAME?: string;
 };
 
 type ShopifySessionPayload = {
@@ -138,11 +214,53 @@ type ApplePayStatusApi = {
 // App
 // -----------------------------------------------------------------------------
 
-const app = new Hono<{ Bindings: Env }>();
+type ObsVars = {
+  requestId: string;
+  flowId: string;
+  step: number;
+};
+
+const app = new Hono<{ Bindings: Env; Variables: ObsVars }>();
 
 const WELL_KNOWN_PATH = '/.well-known/apple-developer-merchantid-domain-association';
 const DEFAULT_VERIFICATION_KV_KEY = 'applepay:partner-verification-file';
 const OAUTH_STATE_COOKIE = '__applepay_oauth_state';
+
+// Global middleware for request tracking and correlation
+app.use('*', async (c, next) => {
+  // Prefer inbound correlation headers, else fall back to cf-ray, else generate.
+  const requestId =
+    c.req.header('x-request-id') ||
+    c.req.header('cf-ray') ||
+    crypto.randomUUID();
+
+  // Flow ID: stable across multiple requests in one "operation" if the UI sends it.
+  const flowId =
+    c.req.header('x-flow-id') ||
+    requestId;
+
+  c.set('requestId', requestId);
+  c.set('flowId', flowId);
+  c.set('step', 0);
+
+  const started = Date.now();
+
+  try {
+    await next();
+  } finally {
+    // Correlation headers back to the client
+    c.header('x-request-id', requestId);
+    c.header('x-flow-id', flowId);
+
+    // Compact latency hint (shows up in browser devtools timing tab)
+    c.header('server-timing', `worker;dur=${Date.now() - started}`);
+
+    logEvent(c, 'info', 'request.complete', {
+      status: c.res?.status ?? null,
+      durationMs: Date.now() - started,
+    });
+  }
+});
 
 function isAppHost(env: Env, url: URL): boolean {
   try {
@@ -264,47 +382,52 @@ async function proxyMerchantTrafficToShopify(c: any, u: URL): Promise<Response> 
   const host = u.hostname;
 
   // Lookup by exact hostname; also try stripping/adding "www.".
-  const row =
-    (await getMerchantDomainByDomain(c.env.DB, host)) ||
-    (host.startsWith('www.')
-      ? await getMerchantDomainByDomain(c.env.DB, host.slice(4))
-      : await getMerchantDomainByDomain(c.env.DB, `www.${host}`));
+  const row = await withStep(c, 'db.getMerchantDomainByDomain', async () => {
+    const exact = await getMerchantDomainByDomain(c.env.DB, host);
+    if (exact) return exact;
+    if (host.startsWith('www.')) {
+      return await getMerchantDomainByDomain(c.env.DB, host.slice(4));
+    }
+    return await getMerchantDomainByDomain(c.env.DB, `www.${host}`);
+  });
 
   // If we don't recognize the hostname, just fall back to the default fetch.
   if (!row) {
+    logEvent(c, 'warn', 'proxy.unknownDomain', { domain: host });
     return fetch(c.req.raw);
   }
 
   // Proxy to Shopify but preserve the original Host header so Shopify routes
   // the request as a custom domain storefront.
-  const originUrl = new URL(c.req.url);
-  originUrl.protocol = 'https:';
-  originUrl.hostname = row.shop;
-  originUrl.port = '';
+  return await withStep(c, 'proxy.forwardToShopify', async () => {
+    const originUrl = new URL(c.req.url);
+    originUrl.protocol = 'https:';
+    originUrl.hostname = row.shop;
+    originUrl.port = '';
 
-  const headers = new Headers(c.req.raw.headers);
-  headers.set('host', host);
-  headers.set('x-forwarded-host', host);
-  headers.set('x-forwarded-proto', 'https');
-  headers.set('x-forwarded-ssl', 'on'); // <-- ADDED THIS LINE
+    const headers = new Headers(c.req.raw.headers);
+    headers.set('host', host);
+    headers.set('x-forwarded-host', host);
+    headers.set('x-forwarded-proto', 'https');
+    headers.set('x-forwarded-ssl', 'on');
 
-  const ip = headers.get('cf-connecting-ip');
-  if (ip) headers.set('x-forwarded-for', ip);
+    const ip = headers.get('cf-connecting-ip');
+    if (ip) headers.set('x-forwarded-for', ip);
 
-  // Avoid mismatched content-length on streamed bodies.
-  headers.delete('content-length');
+    // Avoid mismatched content-length on streamed bodies.
+    headers.delete('content-length');
 
-  const method = c.req.method.toUpperCase();
-  const body = method === 'GET' || method === 'HEAD' ? undefined : (c.req.raw.body as any);
+    const method = c.req.method.toUpperCase();
+    const body = method === 'GET' || method === 'HEAD' ? undefined : (c.req.raw.body as any);
 
-  return fetch(originUrl.toString(), {
-    method,
-    headers,
-    body,
-    redirect: 'manual',
+    return fetch(originUrl.toString(), {
+      method,
+      headers,
+      body,
+      redirect: 'manual',
+    });
   });
 }
-
 
 // -----------------------------------------------------------------------------
 // Public (merchant-domain) routes
@@ -313,7 +436,9 @@ async function proxyMerchantTrafficToShopify(c: any, u: URL): Promise<Response> 
 // The domain verification file must be served on EVERY merchant domain at the exact path.
 app.get(WELL_KNOWN_PATH, async (c) => {
   try {
-    const file = await getPartnerVerificationFile(c.env);
+    const file = await withStep(c, 'kv.getPartnerVerificationFile', () =>
+      getPartnerVerificationFile(c.env)
+    );
     return new Response(file, {
       status: 200,
       headers: {
@@ -339,9 +464,14 @@ app.post(
     }
 
     // Find merchant by exact hostname; also try stripping "www.".
-    const row =
-      (await getMerchantDomainByDomain(c.env.DB, host)) ||
-      (host.startsWith('www.') ? await getMerchantDomainByDomain(c.env.DB, host.slice(4)) : null);
+    const row = await withStep(c, 'db.getMerchantDomainByDomain', async () => {
+      const exact = await getMerchantDomainByDomain(c.env.DB, host);
+      if (exact) return exact;
+      if (host.startsWith('www.')) {
+        return await getMerchantDomainByDomain(c.env.DB, host.slice(4));
+      }
+      return null;
+    });
 
     if (!row) {
       return c.json({ error: `No merchant registered for domain: ${host}` }, 404);
@@ -351,16 +481,17 @@ app.post(
     }
 
     const initiativeContext = host;
-
     const merchantIdentifier = row.partner_internal_merchant_identifier;
 
-    const session = await createPaymentSession({
-      fetcher: c.env.APPLE_MTLS,
-      validationUrl: body.validationURL,
-      merchantIdentifier,
-      displayName: row.partner_merchant_name,
-      initiativeContext,
-    });
+    const session = await withStep(c, 'apple.createPaymentSession', () =>
+      createPaymentSession({
+        fetcher: c.env.APPLE_MTLS,
+        validationUrl: body.validationURL,
+        merchantIdentifier,
+        displayName: row.partner_merchant_name,
+        initiativeContext,
+      })
+    );
     return c.json(session);
   },
 );
@@ -604,16 +735,20 @@ app.get('/api/shop', async (c) => {
   if (payload instanceof Response) return payload;
 
   const shop = shopFromDest(payload.dest);
-  const shopRow = await getShopByShop(c.env.DB, shop);
+  const shopRow = await withStep(c, 'db.getShopByShop', () =>
+    getShopByShop(c.env.DB, shop)
+  );
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: 'App not installed for this shop' }, 401);
   }
 
-  const info = await getShopInfo({
-    shop,
-    accessToken: shopRow.access_token,
-    apiVersion: c.env.SHOPIFY_API_VERSION,
-  });
+  const info = await withStep(c, 'shopify.getShopInfo', () =>
+    getShopInfo({
+      shop,
+      accessToken: shopRow.access_token,
+      apiVersion: c.env.SHOPIFY_API_VERSION,
+    })
+  );
 
   const out: ShopInfoApi = {
     shop,
@@ -634,20 +769,22 @@ app.get('/api/applepay/status', async (c) => {
   if (payload instanceof Response) return payload;
 
   const shop = shopFromDest(payload.dest);
-  const shopRow = await getShopByShop(c.env.DB, shop);
+  const shopRow = await withStep(c, 'db.getShopByShop', () =>
+    getShopByShop(c.env.DB, shop)
+  );
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: 'App not installed for this shop' }, 401);
   }
 
   const requestedDomain = (c.req.query('domain') || '').trim().toLowerCase();
-  let md = null as Awaited<ReturnType<typeof getMerchantDomainByShop>>;
-  if (requestedDomain) {
-    const byDomain = await getMerchantDomainByDomain(c.env.DB, requestedDomain);
-    if (byDomain && byDomain.shop === shop) md = byDomain;
-  }
-  if (!md) {
-    md = await getMerchantDomainByShop(c.env.DB, shop);
-  }
+  let md = await withStep(c, 'db.getMerchantDomain', async () => {
+    if (requestedDomain) {
+      const byDomain = await getMerchantDomainByDomain(c.env.DB, requestedDomain);
+      if (byDomain && byDomain.shop === shop) return byDomain;
+    }
+    return await getMerchantDomainByShop(c.env.DB, shop);
+  });
+
   return c.json(toApplePayStatus(md), 200, { ...noStoreHeaders() });
 });
 
@@ -660,47 +797,81 @@ app.post('/api/applepay/onboard', async (c) => {
   if (payload instanceof Response) return payload;
 
   const shop = shopFromDest(payload.dest);
-  const shopRow = await getShopByShop(c.env.DB, shop);
+  const shopRow = await withStep(c, 'db.getShopByShop', () =>
+    getShopByShop(c.env.DB, shop)
+  );
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: 'App not installed for this shop' }, 401);
   }
 
   // Fetch freshest info from Shopify.
-  const info = await getShopInfo({
-    shop,
-    accessToken: shopRow.access_token,
-    apiVersion: c.env.SHOPIFY_API_VERSION,
-  });
+  const info = await withStep(c, 'shopify.getShopInfo', () =>
+    getShopInfo({
+      shop,
+      accessToken: shopRow.access_token,
+      apiVersion: c.env.SHOPIFY_API_VERSION,
+    })
+  );
   const domain = (info.primaryDomainHost || '').trim();
   if (!domain || domain.endsWith('.myshopify.com')) {
     return c.json({ error: 'A custom primary domain is required (not *.myshopify.com)' }, 400);
   }
 
   // Ensure Cloudflare Custom Hostname exists for this domain.
-let ch = null as Awaited<ReturnType<typeof findCustomHostname>>;
-try {
-  const existing = await findCustomHostname({
-    apiToken: c.env.CF_API_TOKEN,
-    zoneId: c.env.CF_ZONE_ID,
-    hostname: domain,
+  let ch = await withStep(c, 'cloudflare.findOrCreateCustomHostname', async () => {
+    try {
+      const existing = await findCustomHostname({
+        apiToken: c.env.CF_API_TOKEN,
+        zoneId: c.env.CF_ZONE_ID,
+        hostname: domain,
+      });
+
+      if (existing) return existing;
+
+      return await createCustomHostname({
+        apiToken: c.env.CF_API_TOKEN,
+        zoneId: c.env.CF_ZONE_ID,
+        hostname: domain,
+        customMetadata: {
+          shop,
+          shop_id: shopRow.shop_id,
+        },
+      });
+    } catch (e: any) {
+      const dnsInstructions = dnsInstructionsFor(domain, c.env.CF_SAAS_CNAME_TARGET);
+      await upsertMerchantDomain(c.env.DB, {
+        shop,
+        shopId: shopRow.shop_id,
+        domain,
+        partnerInternalMerchantIdentifier: shopRow.shop_id,
+        partnerMerchantName: info.name,
+        encryptTo: c.env.APPLE_ENCRYPT_TO,
+        environment: c.env.APPLE_ENV,
+        status: 'DNS_NOT_CONFIGURED',
+        lastError: e?.message || String(e),
+        cloudflareHostnameId: null,
+        cloudflareHostnameStatus: null,
+        cloudflareSslStatus: null,
+        appleLastCheckedAt: null,
+      });
+      throw e;
+    }
+  }).catch(async (e) => {
+    const dnsInstructions = dnsInstructionsFor(domain, c.env.CF_SAAS_CNAME_TARGET);
+    const md = await getMerchantDomainByShop(c.env.DB, shop);
+    return c.json(toApplePayStatus(md, dnsInstructions), 200, {
+      ...noStoreHeaders(),
+    });
   });
 
-  ch = existing;
+  if (ch instanceof Response) return ch;
 
-  if (!ch) {
-    ch = await createCustomHostname({
-      apiToken: c.env.CF_API_TOKEN,
-      zoneId: c.env.CF_ZONE_ID,
-      hostname: domain,
-      customMetadata: {
-        shop,
-        shop_id: shopRow.shop_id,
-      },
-    });
-  }
-} catch (e: any) {
-    const dnsInstructions = dnsInstructionsFor(domain, c.env.CF_SAAS_CNAME_TARGET);
-    await upsertMerchantDomain(c.env.DB, {
+  const cfHostStatus = ch.status || null;
+  const cfSslStatus = ch.ssl?.status || null;
+
+  // Persist/refresh our merchant domain record.
+  await withStep(c, 'db.upsertMerchantDomain', () =>
+    upsertMerchantDomain(c.env.DB, {
       shop,
       shopId: shopRow.shop_id,
       domain,
@@ -709,56 +880,40 @@ try {
       encryptTo: c.env.APPLE_ENCRYPT_TO,
       environment: c.env.APPLE_ENV,
       status: 'DNS_NOT_CONFIGURED',
-      lastError: e?.message || String(e),
-      cloudflareHostnameId: null,
-      cloudflareHostnameStatus: null,
-      cloudflareSslStatus: null,
-      appleLastCheckedAt: null,
-    });
-
-    return c.json(toApplePayStatus(await getMerchantDomainByShop(c.env.DB, shop), dnsInstructions), 200, {
-      ...noStoreHeaders(),
-    });
-  }
-
-  const cfHostStatus = ch.status || null;
-  const cfSslStatus = ch.ssl?.status || null;
-
-  // Persist/refresh our merchant domain record.
-  await upsertMerchantDomain(c.env.DB, {
-    shop,
-    shopId: shopRow.shop_id,
-    domain,
-    partnerInternalMerchantIdentifier: shopRow.shop_id,
-    partnerMerchantName: info.name,
-    encryptTo: c.env.APPLE_ENCRYPT_TO,
-    environment: c.env.APPLE_ENV,
-    status: 'DNS_NOT_CONFIGURED',
-    lastError: null,
-    cloudflareHostnameId: ch.id,
-    cloudflareHostnameStatus: cfHostStatus,
-    cloudflareSslStatus: cfSslStatus,
-    appleLastCheckedAt: null,
-  });
-
-  // Preflight: verify the merchant domain is already serving the partner verification file.
-  const expectedFile = await getPartnerVerificationFile(c.env);
-  const preflight = await preflightVerificationFile(domain, expectedFile);
-  if (!preflight.ok) {
-    const dnsInstructions = dnsInstructionsFor(domain, c.env.CF_SAAS_CNAME_TARGET);
-
-    await updateMerchantDomainCloudflareStatus(c.env.DB, {
-      domain,
+      lastError: null,
       cloudflareHostnameId: ch.id,
       cloudflareHostnameStatus: cfHostStatus,
       cloudflareSslStatus: cfSslStatus,
-      lastError: preflight.reason || 'Domain not serving verification file yet',
-    });
-    await updateMerchantDomainAppleStatus(c.env.DB, {
-      domain,
-      status: 'DNS_NOT_CONFIGURED',
-      lastError: preflight.reason || 'Domain not serving verification file yet',
-      appleLastCheckedAt: nowIso(),
+      appleLastCheckedAt: null,
+    })
+  );
+
+  // Preflight: verify the merchant domain is already serving the partner verification file.
+  const expectedFile = await withStep(c, 'kv.getPartnerVerificationFile', () =>
+    getPartnerVerificationFile(c.env)
+  );
+
+  const preflight = await withStep(c, 'preflight.verificationFile', () =>
+    preflightVerificationFile(domain, expectedFile)
+  );
+
+  if (!preflight.ok) {
+    const dnsInstructions = dnsInstructionsFor(domain, c.env.CF_SAAS_CNAME_TARGET);
+
+    await withStep(c, 'db.updateMerchantDomainStatuses', async () => {
+      await updateMerchantDomainCloudflareStatus(c.env.DB, {
+        domain,
+        cloudflareHostnameId: ch.id,
+        cloudflareHostnameStatus: cfHostStatus,
+        cloudflareSslStatus: cfSslStatus,
+        lastError: preflight.reason || 'Domain not serving verification file yet',
+      });
+      await updateMerchantDomainAppleStatus(c.env.DB, {
+        domain,
+        status: 'DNS_NOT_CONFIGURED',
+        lastError: preflight.reason || 'Domain not serving verification file yet',
+        appleLastCheckedAt: nowIso(),
+      });
     });
 
     const md = await getMerchantDomainByShop(c.env.DB, shop);
@@ -768,32 +923,38 @@ try {
   // Apple requires the file in place BEFORE registerMerchant.
   // Now that preflight succeeded, we can register the merchant.
   try {
-    await registerMerchant({
-      fetcher: c.env.APPLE_MTLS,
-      appleEnv: c.env.APPLE_ENV,
-      domain,
-      encryptTo: c.env.APPLE_ENCRYPT_TO,
-      partnerInternalMerchantIdentifier: shopRow.shop_id,
-      partnerMerchantName: info.name,
-      useJwt: c.env.APPLE_USE_JWT === 'true',
-      issuer: c.env.APPLE_ENCRYPT_TO,
-      certificatePem: c.env.APPLE_JWT_CERT_PEM,
-      privateKeyPem: c.env.APPLE_JWT_PRIVATE_KEY_PEM,
-    });
+    await withStep(c, 'apple.registerMerchant', () =>
+      registerMerchant({
+        fetcher: c.env.APPLE_MTLS,
+        appleEnv: c.env.APPLE_ENV,
+        domain,
+        encryptTo: c.env.APPLE_ENCRYPT_TO,
+        partnerInternalMerchantIdentifier: shopRow.shop_id,
+        partnerMerchantName: info.name,
+        useJwt: c.env.APPLE_USE_JWT === 'true',
+        issuer: c.env.APPLE_ENCRYPT_TO,
+        certificatePem: c.env.APPLE_JWT_CERT_PEM,
+        privateKeyPem: c.env.APPLE_JWT_PRIVATE_KEY_PEM,
+      })
+    );
 
-    await updateMerchantDomainAppleStatus(c.env.DB, {
-      domain,
-      status: 'VERIFIED',
-      lastError: null,
-      appleLastCheckedAt: nowIso(),
-    });
+    await withStep(c, 'db.updateMerchantDomainAppleStatus', () =>
+      updateMerchantDomainAppleStatus(c.env.DB, {
+        domain,
+        status: 'VERIFIED',
+        lastError: null,
+        appleLastCheckedAt: nowIso(),
+      })
+    );
   } catch (e: any) {
-    await updateMerchantDomainAppleStatus(c.env.DB, {
-      domain,
-      status: 'ERROR',
-      lastError: e?.message || String(e),
-      appleLastCheckedAt: nowIso(),
-    });
+    await withStep(c, 'db.updateMerchantDomainAppleStatus', () =>
+      updateMerchantDomainAppleStatus(c.env.DB, {
+        domain,
+        status: 'ERROR',
+        lastError: e?.message || String(e),
+        appleLastCheckedAt: nowIso(),
+      })
+    );
   }
 
   const md = await getMerchantDomainByShop(c.env.DB, shop);
@@ -809,31 +970,39 @@ app.post('/api/applepay/check', async (c) => {
   if (payload instanceof Response) return payload;
 
   const shop = shopFromDest(payload.dest);
-  const shopRow = await getShopByShop(c.env.DB, shop);
+  const shopRow = await withStep(c, 'db.getShopByShop', () =>
+    getShopByShop(c.env.DB, shop)
+  );
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: 'App not installed for this shop' }, 401);
   }
 
-  const md = await getMerchantDomainByShop(c.env.DB, shop);
+  const md = await withStep(c, 'db.getMerchantDomainByShop', () =>
+    getMerchantDomainByShop(c.env.DB, shop)
+  );
   if (!md) return c.json(toApplePayStatus(null), 200, { ...noStoreHeaders() });
 
   try {
-    const details = await getMerchantDetails({
-      fetcher: c.env.APPLE_MTLS,
-      appleEnv: c.env.APPLE_ENV,
-      merchantIdentifier: md.partner_internal_merchant_identifier,
-      useJwt: c.env.APPLE_USE_JWT === 'true',
-      issuer: c.env.APPLE_ENCRYPT_TO,
-      certificatePem: c.env.APPLE_JWT_CERT_PEM,
-      privateKeyPem: c.env.APPLE_JWT_PRIVATE_KEY_PEM,
-    });
+    const details = await withStep(c, 'apple.getMerchantDetails', () =>
+      getMerchantDetails({
+        fetcher: c.env.APPLE_MTLS,
+        appleEnv: c.env.APPLE_ENV,
+        merchantIdentifier: md.partner_internal_merchant_identifier,
+        useJwt: c.env.APPLE_USE_JWT === 'true',
+        issuer: c.env.APPLE_ENCRYPT_TO,
+        certificatePem: c.env.APPLE_JWT_CERT_PEM,
+        privateKeyPem: c.env.APPLE_JWT_PRIVATE_KEY_PEM,
+      })
+    );
     // We don’t have a formal status field; treat successful fetch as healthy.
-    await updateMerchantDomainAppleStatus(c.env.DB, {
-      domain: md.domain,
-      status: md.status,
-      lastError: null,
-      appleLastCheckedAt: nowIso(),
-    });
+    await withStep(c, 'db.updateMerchantDomainAppleStatus', () =>
+      updateMerchantDomainAppleStatus(c.env.DB, {
+        domain: md.domain,
+        status: md.status,
+        lastError: null,
+        appleLastCheckedAt: nowIso(),
+      })
+    );
     return c.json(
       {
         ...toApplePayStatus(await getMerchantDomainByShop(c.env.DB, shop)),
@@ -843,12 +1012,14 @@ app.post('/api/applepay/check', async (c) => {
       { ...noStoreHeaders() },
     );
   } catch (e: any) {
-    await updateMerchantDomainAppleStatus(c.env.DB, {
-      domain: md.domain,
-      status: 'ERROR',
-      lastError: e?.message || String(e),
-      appleLastCheckedAt: nowIso(),
-    });
+    await withStep(c, 'db.updateMerchantDomainAppleStatus', () =>
+      updateMerchantDomainAppleStatus(c.env.DB, {
+        domain: md.domain,
+        status: 'ERROR',
+        lastError: e?.message || String(e),
+        appleLastCheckedAt: nowIso(),
+      })
+    );
     return c.json(toApplePayStatus(await getMerchantDomainByShop(c.env.DB, shop)), 200, { ...noStoreHeaders() });
   }
 });
@@ -863,13 +1034,9 @@ app.all('*', async (c) => {
   // ---------------------------------------------------------------------------
   // Merchant domain traffic (custom hostnames)
   // ---------------------------------------------------------------------------
-  // For merchant storefront traffic we ONLY intercept Apple Pay-specific routes
-  // (handled above). Everything else should pass through to the per-hostname
-  // custom origin configured in Cloudflare for SaaS (custom_origin_server).
-if (!isAppHost(c.env, u)) {
-  return proxyMerchantTrafficToShopify(c, u);
-}
-
+  if (!isAppHost(c.env, u)) {
+    return proxyMerchantTrafficToShopify(c, u);
+  }
 
   // ---------------------------------------------------------------------------
   // App host traffic (embedded admin UI)
@@ -887,7 +1054,9 @@ if (!isAppHost(c.env, u)) {
     if (shopParam && hostParam) {
       const shop = normalizeShopParam(shopParam);
       if (isValidShopDomain(shop)) {
-        const existing = await getShopByShop(c.env.DB, shop);
+        const existing = await withStep(c, 'db.getShopByShop', () =>
+          getShopByShop(c.env.DB, shop)
+        );
         if (!existing) {
           const authUrl = new URL('/auth', c.env.SHOPIFY_APP_URL);
           authUrl.searchParams.set('shop', shop);
@@ -909,14 +1078,55 @@ if (!isAppHost(c.env, u)) {
   return new Response(res.body, { status: res.status, headers });
 });
 
-export default {
+// --- OpenTelemetry Configuration ---
+const otelConfig: ResolveConfigFn = (env: Env, _trigger) => {
+  return {
+    exporter: {
+      url: env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://localhost:4318',
+      headers: {
+        // Safe extraction of the secret header
+        'DD-API-KEY': env.OTEL_EXPORTER_OTLP_HEADERS?.split('=')[1] || '',
+      },
+    },
+    service: { name: env.OTEL_SERVICE_NAME || 'applepay-control-plane' },
+  };
+};
+
+// --- Your Existing Logic (Wrapped in a variable) ---
+const handler = {
   // 1. Pass web requests to your existing Hono app
   fetch: app.fetch,
 
   // 2. Add the missing Scheduled handler for Cron triggers
-  scheduled: (_event: ScheduledEvent, _env: Env, _ctx: ExecutionContext) => {
+  scheduled: (_controller: ScheduledController, _env: Env, _ctx: ExecutionContext) => {
     // no-op: prevents cron trigger exceptions
     console.log("Cron trigger fired");
     // Add any scheduled logic here if needed
   },
 };
+
+app.onError((err, c) => {
+  logEvent(c, 'error', 'unhandled.exception', { error: safeError(err) });
+
+  const requestId = (c.get('requestId') ?? 'unknown') as string;
+  const flowId = (c.get('flowId') ?? requestId) as string;
+
+  const accept = c.req.header('accept') ?? '';
+  if (accept.includes('text/html')) {
+    return c.html(
+      `<!doctype html>
+      <html><body style="font-family: system-ui; padding: 24px;">
+        <h2>Something went wrong</h2>
+        <p>Request ID: <code>${requestId}</code></p>
+        <p>Flow ID: <code>${flowId}</code></p>
+      </body></html>`,
+      500,
+    );
+  }
+
+  return c.json({ error: 'Internal error', requestId, flowId }, 500);
+});
+
+
+// --- The Final Export (Wraps your handler) ---
+export default instrument(handler, otelConfig);
