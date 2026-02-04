@@ -1088,7 +1088,7 @@ app.all('*', async (c) => {
         const existing = await withStep(c, 'db.getShopByShop', () =>
           getShopByShop(c.env.DB, shop)
         );
-        if (!existing) {
+        if (!existing || existing.uninstalled_at) {
           const authUrl = new URL('/auth', c.env.SHOPIFY_APP_URL);
           authUrl.searchParams.set('shop', shop);
           authUrl.searchParams.set('host', hostParam);
@@ -1143,7 +1143,15 @@ app.onError((err, c) => {
   const flowId = (c.get('flowId') ?? requestId) as string;
 
   const accept = c.req.header('accept') ?? '';
-  if (accept.includes('text/html')) {
+  const xRequestedWith = c.req.header('x-requested-with') ?? '';
+
+  // Prefer JSON for XHR / API calls (even if the browser also accepts text/html).
+  const wantsJson =
+    accept.includes('application/json') ||
+    accept.includes('application/*+json') ||
+    xRequestedWith.toLowerCase() === 'xmlhttprequest';
+
+  if (!wantsJson && accept.includes('text/html')) {
     return c.html(
       `<!doctype html>
       <html><body style="font-family: system-ui; padding: 24px;">
@@ -1157,6 +1165,7 @@ app.onError((err, c) => {
 
   return c.json({ error: 'Internal error', requestId, flowId }, 500);
 });
+
 
 // --- The Final Export (Wraps your handler) ---
 export default instrument(handler, otelConfig);

@@ -1,5 +1,5 @@
 // apps/control-plane/src/types.d.ts
-import { Env } from './worker-configuration';
+import { Env } from '../worker-configuration';
 
 declare module './worker-configuration' {
   interface Env {

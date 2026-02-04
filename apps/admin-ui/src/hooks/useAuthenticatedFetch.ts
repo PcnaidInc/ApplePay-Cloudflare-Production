@@ -1,51 +1,94 @@
+// FILE: apps/admin-ui/src/hooks/useAuthenticatedFetch.ts
 import { useCallback } from 'react';
 import { getSessionToken } from '@shopify/app-bridge/utilities';
+import { Redirect } from '@shopify/app-bridge/actions';
 import { useAppBridge } from '../context/appBridge';
 
-type AuthenticatedFetch = (url: string, init?: RequestInit) => Promise<Response>;
+function getShopAndHostFromUrl(): { shop: string | null; host: string | null } {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    shop: params.get('shop'),
+    host: params.get('host'),
+  };
+}
+
+function redirectToAuth(app: ReturnType<typeof useAppBridge>) {
+  const { shop, host } = getShopAndHostFromUrl();
+  if (!shop || !host) return;
+
+  const authUrl = new URL('/auth', window.location.origin);
+  authUrl.searchParams.set('shop', shop);
+  authUrl.searchParams.set('host', host);
+
+  // Force TOP-level redirect (break out of the Shopify Admin iframe safely)
+  Redirect.create(app).dispatch(Redirect.Action.REMOTE, authUrl.toString());
+}
 
 /**
- * Custom hook that provides an authenticated fetch function.
- *
- * Shopify embedded apps must send a short-lived session token (JWT) on every
- * request to protected backend routes via:
- *   Authorization: Bearer <token>
- *
- * This wrapper also:
- * - sets a sane default Accept header for JSON APIs
- * - adds X-Requested-With to avoid auth redirect loops in some middleware stacks
- * - only auto-sets Content-Type when you're sending a string body
+ * Provides an authenticated fetch that:
+ *  - injects Shopify session token
+ *  - if we get 401 from our API, kicks off OAuth again
  */
-export function useAuthenticatedFetch(): AuthenticatedFetch {
+export function useAuthenticatedFetch() {
   const app = useAppBridge();
 
-  return useCallback(
+  const authenticatedFetch = useCallback(
     async (url: string, init: RequestInit = {}): Promise<Response> => {
-      const token = await getSessionToken(app);
+      // Only apply this logic to same-origin API calls.
+      const resolved = new URL(url, window.location.origin);
+      const isSameOrigin = resolved.origin === window.location.origin;
+      const isApiCall = resolved.pathname.startsWith('/api/');
+      const shouldAuth = isSameOrigin && isApiCall;
 
-      // If this ever happens, don't send a broken request (it would become "Bearer ").
-      if (!token || typeof token !== 'string' || token.trim().length === 0) {
-        throw new Error('Failed to obtain Shopify session token (empty token).');
+      if (!shouldAuth) {
+        return fetch(url, init);
+      }
+
+      let token: string;
+      try {
+        token = await getSessionToken(app);
+      } catch (err) {
+        // If we can't get a token, we're not properly embedded — best effort: restart auth.
+        redirectToAuth(app);
+        throw err;
       }
 
       const headers = new Headers(init.headers);
-
       headers.set('Authorization', `Bearer ${token}`);
-      headers.set('X-Requested-With', 'XMLHttpRequest');
-
-      // Default JSON expectations unless caller overrides.
       if (!headers.has('Accept')) headers.set('Accept', 'application/json');
 
-      // Only assume JSON if the body is a string (we don't want to break FormData uploads).
-      if (typeof init.body === 'string' && !headers.has('Content-Type')) {
-        headers.set('Content-Type', 'application/json');
+      const res = await fetch(url, { ...init, headers });
+
+      if (res.status === 401) {
+        // Read the error message without consuming the original response body
+        let errorMessage = '';
+        try {
+          const cloned = res.clone();
+          const ct = cloned.headers.get('content-type') || '';
+          if (ct.includes('application/json')) {
+            const body = (await cloned.json().catch(() => null)) as any;
+            if (typeof body?.error === 'string') errorMessage = body.error;
+          } else {
+            errorMessage = await cloned.text().catch(() => '');
+          }
+        } catch {
+          // ignore
+        }
+
+        // These are the “we should redo OAuth” cases.
+        if (
+          errorMessage.includes('App not installed') ||
+          errorMessage.includes('Invalid Shopify session token') ||
+          errorMessage.includes('Missing Authorization')
+        ) {
+          redirectToAuth(app);
+        }
       }
 
-      return fetch(url, {
-        ...init,
-        headers,
-      });
+      return res;
     },
-    [app],
+    [app]
   );
+
+  return authenticatedFetch;
 }

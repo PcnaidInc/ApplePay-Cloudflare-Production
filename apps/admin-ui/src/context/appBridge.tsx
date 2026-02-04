@@ -1,10 +1,14 @@
-import { createContext, useContext, useMemo, type ReactNode } from "react";
-import createApp, { type AppConfigV2, type ClientApplication } from "@shopify/app-bridge";
+// FILE: apps/admin-ui/src/context/appBridge.tsx
+import { createContext, useContext, useMemo, type ReactNode } from 'react';
+import createApp, { type ClientApplication } from '@shopify/app-bridge';
+
+// This guarantees our config type always matches the installed @shopify/app-bridge version.
+type AppBridgeConfig = Parameters<typeof createApp>[0];
 
 const AppBridgeContext = createContext<ClientApplication | null>(null);
 
 interface AppBridgeProviderProps {
-  config: AppConfigV2; // ✅ require V2
+  config: AppBridgeConfig;
   children: ReactNode;
 }
 
@@ -15,6 +19,8 @@ export function AppBridgeProvider({ config, children }: AppBridgeProviderProps) 
 
 export function useAppBridge(): ClientApplication {
   const app = useContext(AppBridgeContext);
-  if (!app) throw new Error("AppBridgeProvider is missing from the component tree.");
+  if (!app) {
+    throw new Error('AppBridgeProvider is missing from the component tree.');
+  }
   return app;
 }

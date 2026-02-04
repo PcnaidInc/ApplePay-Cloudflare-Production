@@ -46,7 +46,9 @@
     "APPLE_VERIFICATION_KV_KEY": "applepay:partner-verification-file",
     "APPLE_ENCRYPT_TO": "platformintegrator.com.pcnaid.shopifyverifier",
     "SHOPIFY_APP_URL": "https://applepay-control-plane.pcnaid.workers.dev",
-	"OTEL_SERVICE_NAME": "applepay-control-plane",
+	  "OTEL_SERVICE_NAME": "applepay-control-plane",
+    "DEFAULT_DOMAIN": "pcnaid-edge.com",
+    "DEFAULT_MERCHANT_ID": "default",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.datadoghq.com/v1/traces"
   },
   "triggers": {
