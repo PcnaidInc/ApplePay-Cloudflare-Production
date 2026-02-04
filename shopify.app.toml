@@ -6,8 +6,24 @@ application_url = "https://applepay-control-plane.pcnaid.workers.dev"
 embedded = true
 handle = "verify-applepay"
 
+[build]
+automatically_update_urls_on_dev =true
+dev_store_url = "https://app-dev-store-v1.myshopify.com"
+
+[app_preferences]
+url = "https://applepay-control-plane.pcnaid.workers.dev/preferences"
+
+[access.admin]
+direct_api_mode = "online"
+embedded_app_direct_api_access =true
+
 [webhooks]
 api_version = "2025-07"
+
+[[webhooks.subscriptions]]
+topics = [ "app/uninstalled" ]
+compliance_topics = [ "customers/redact", "customers/data_request", "shop/redact" ]
+uri = "https://applepay-control-plane.pcnaid.workers.dev/webhooks"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
@@ -17,5 +33,19 @@ use_legacy_install_flow = false
 
 [auth]
 redirect_urls = [
-  "https://applepay-control-plane.pcnaid.workers.dev/auth/callback"
+  "https://applepay-control-plane.pcnaid.workers.dev/auth/callback",
+  "https://applepay-control-plane.pcnaid.workers.dev/auth/oauth/callback",
 ]
+[customer_authentication]
+redirect_uris = [
+  "https://applepay-control-plane.pcnaid.workers.dev/api/customer/auth/callback"
+]
+javascript_origins = [
+  "https://applepay-control-plane.pcnaid.workers.dev"
+]
+logout_urls = [
+  "https://applepay-control-plane.pcnaid.workers.dev/api/customer/logout"
+]
+
+
+

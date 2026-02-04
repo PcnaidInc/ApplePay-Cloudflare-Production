@@ -1,25 +1,30 @@
-import { useEffect, useMemo, useState } from 'react';
-import createApp from '@shopify/app-bridge';
-import { Redirect } from '@shopify/app-bridge/actions';
-import { authenticatedFetch } from '@shopify/app-bridge/utilities';
+// FILE: apps/admin-ui/src/App.tsx
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { AppBridgeProvider } from './context/appBridge';
+import { useAuthenticatedFetch } from './hooks/useAuthenticatedFetch';
 import {
+  Badge,
   Banner,
   BlockStack,
+  Box,
   Button,
   Card,
+  Checkbox,
+  DataTable,
   Divider,
   InlineStack,
   Layout,
-  Link,
+  Modal,
   Page,
-  Spinner,
+  Tabs,
   Text,
-  List,
+  TextField,
 } from '@shopify/polaris';
 
 type Config = {
   shopifyApiKey: string;
   appUrl: string;
+  cnameTarget: string;
 };
 
 type ShopInfo = {
@@ -29,24 +34,659 @@ type ShopInfo = {
   primaryDomain: string | null;
 };
 
-type ApplePayStatus = {
+type DnsInstructions = {
+  recordType: 'CNAME' | 'ALIAS' | 'ANAME';
+  host: string;
+  value: string;
+  note?: string;
+};
+
+type ApplePayDomain = {
   domain: string | null;
   status: string;
   lastError: string | null;
   cloudflareHostnameStatus: string | null;
   cloudflareSslStatus: string | null;
-  dnsInstructions?: {
-    recordType: 'CNAME' | 'ALIAS' | 'ANAME';
-    host: string;
-    value: string;
-    note?: string;
-  };
-  appleMerchantId?: string;
+  appleLastCheckedAt: string | null;
+  appleMerchantId: string | null;
+  dnsInstructions: DnsInstructions | null;
+
+  // extra fields from /api/applepay/domains (optional)
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  cloudflareHostnameId?: string | null;
 };
+
+type DomainsResponse = {
+  ok: true;
+  domains: ApplePayDomain[];
+};
+
+type ApiErrorBody = { error: string; details?: unknown };
+
+class ApiError extends Error {
+  status: number;
+  details?: unknown;
+  constructor(message: string, status: number, details?: unknown) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.details = details;
+  }
+}
 
 function getQueryParam(name: string): string | null {
   const url = new URL(window.location.href);
   return url.searchParams.get(name);
+}
+
+function coerceHostname(input: string): string {
+  const raw = String(input || '').trim();
+  if (!raw) return '';
+  try {
+    const u = raw.includes('://') ? new URL(raw) : new URL(`https://${raw}`);
+    return (u.hostname || '').trim().toLowerCase();
+  } catch {
+    return (raw.split(/[/?#]/)[0] || '').trim().toLowerCase();
+  }
+}
+
+type Bucket = 'all' | 'pending' | 'inProcess' | 'error' | 'completed';
+
+function bucketForStatus(status: string): Bucket {
+  switch (status) {
+    case 'VERIFIED':
+      return 'completed';
+    case 'PENDING':
+      return 'inProcess';
+    case 'DNS_NOT_CONFIGURED':
+    case 'NOT_STARTED':
+      return 'pending';
+    case 'ERROR':
+      return 'error';
+    default:
+      return 'pending';
+  }
+}
+
+function labelForStatus(status: string): string {
+  switch (status) {
+    case 'VERIFIED':
+      return 'Registered';
+    case 'PENDING':
+      return 'In process';
+    case 'DNS_NOT_CONFIGURED':
+      return 'Pending DNS';
+    case 'ERROR':
+      return 'Error';
+    case 'UNREGISTERED':
+      return 'Disabled';
+    default:
+      return status;
+  }
+}
+
+function toneForStatus(status: string): 'success' | 'info' | 'attention' | 'critical' | undefined {
+  switch (status) {
+    case 'VERIFIED':
+      return 'success';
+    case 'PENDING':
+      return 'info';
+    case 'DNS_NOT_CONFIGURED':
+      return 'attention';
+    case 'ERROR':
+      return 'critical';
+    case 'UNREGISTERED':
+      return undefined;
+    default:
+      return 'attention';
+  }
+}
+
+function AppContent({ config }: { config: Config }) {
+  const authenticatedFetch = useAuthenticatedFetch();
+
+  const [shopInfo, setShopInfo] = useState<ShopInfo | null>(null);
+  const [domains, setDomains] = useState<ApplePayDomain[]>([]);
+  const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
+
+  const [infoBanner, setInfoBanner] = useState<string | null>(null);
+  const [errorBanner, setErrorBanner] = useState<string | null>(null);
+
+  const [activeTab, setActiveTab] = useState(0);
+
+  // Add Domain modal state
+  const [addOpen, setAddOpen] = useState(false);
+  const [step, setStep] = useState<1 | 2>(1);
+  const [domainInput, setDomainInput] = useState('');
+  const [manualConfirmed, setManualConfirmed] = useState(false);
+  const [domainConnectConfirmed, setDomainConnectConfirmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  // Auto-retry (only for domains submitted during this session)
+  const autoRetryDomains = useRef<Set<string>>(new Set());
+  const retryState = useRef<Record<string, { inFlight: boolean; lastAttemptMs: number }>>({});
+
+  async function apiFetch(path: string, opts: RequestInit = {}): Promise<Response> {
+    return authenticatedFetch(path, opts);
+  }
+
+  async function apiJson<T>(path: string, opts: RequestInit = {}): Promise<T> {
+    const res = await apiFetch(path, opts);
+    const text = await res.text();
+    const json = text ? JSON.parse(text) : null;
+    if (!res.ok) {
+      const body = json as ApiErrorBody | null;
+      throw new ApiError(body?.error || `Request failed (${res.status})`, res.status, body?.details);
+    }
+    return json as T;
+  }
+
+  async function refreshShopInfo() {
+    const info = await apiJson<ShopInfo>('/api/shop');
+    setShopInfo(info);
+  }
+
+  async function refreshDomains() {
+    const res = await apiJson<DomainsResponse>('/api/applepay/domains');
+    setDomains(res.domains || []);
+    // keep selection valid
+    if (selectedDomain) {
+      const stillThere = (res.domains || []).some((d) => d.domain === selectedDomain);
+      if (!stillThere) setSelectedDomain(null);
+    }
+  }
+
+  async function onboardDomain(domain: string, { silent = false }: { silent?: boolean } = {}) {
+    const normalized = coerceHostname(domain);
+    if (!normalized) return;
+
+    try {
+      if (!silent) setBusy(true);
+      const updated = await apiJson<ApplePayDomain>('/api/applepay/onboard', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ domain: normalized }),
+      });
+
+      setDomains((prev) => {
+        const next = [...prev];
+        const idx = next.findIndex((d) => d.domain === updated.domain);
+        if (idx >= 0) next[idx] = { ...next[idx], ...updated };
+        else next.unshift(updated);
+        return next;
+      });
+
+      if (!silent) setInfoBanner(`Onboarding started for ${normalized}`);
+      setErrorBanner(null);
+
+      // enable auto-retry for this domain
+      autoRetryDomains.current.add(normalized);
+    } catch (e: unknown) {
+      if (!silent) setErrorBanner(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (!silent) setBusy(false);
+    }
+  }
+
+  // When app bridge becomes ready, load shop + domains
+  useEffect(() => {
+    (async () => {
+      try {
+        await refreshShopInfo();
+        await refreshDomains();
+      } catch (e: unknown) {
+        setErrorBanner(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authenticatedFetch]);
+
+  // Poll every 5 seconds (status refresh)
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      refreshDomains().catch(() => {
+        // keep quiet on polling errors
+      });
+
+      // Auto-retry for domains submitted during this session (every ~5s)
+      const now = Date.now();
+      for (const d of autoRetryDomains.current) {
+        const state = retryState.current[d] || { inFlight: false, lastAttemptMs: 0 };
+        if (state.inFlight) continue;
+        if (now - state.lastAttemptMs < 5000) continue;
+
+        const current = domains.find((x) => x.domain === d);
+        if (!current) continue;
+        if (current.status === 'VERIFIED' || current.status === 'UNREGISTERED') continue;
+
+        retryState.current[d] = { inFlight: true, lastAttemptMs: now };
+        onboardDomain(d, { silent: true })
+          .catch(() => {
+            // Silently ignore retry errors to avoid disrupting the polling loop
+          })
+          .finally(() => {
+            retryState.current[d] = { inFlight: false, lastAttemptMs: now };
+          });
+      }
+    }, 5000);
+
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authenticatedFetch, domains]);
+
+  const selected = useMemo(() => {
+    if (!selectedDomain) return null;
+    return domains.find((d) => d.domain === selectedDomain) || null;
+  }, [domains, selectedDomain]);
+
+  const counts = useMemo(() => {
+    const c = { all: domains.length, pending: 0, inProcess: 0, error: 0, completed: 0 };
+    for (const d of domains) {
+      const b = bucketForStatus(d.status);
+      if (b === 'pending') c.pending += 1;
+      if (b === 'inProcess') c.inProcess += 1;
+      if (b === 'error') c.error += 1;
+      if (b === 'completed') c.completed += 1;
+    }
+    return c;
+  }, [domains]);
+
+  const tabs = useMemo(
+    () => [
+      { id: 'all', content: `All (${counts.all})`, panelID: 'all-panel' },
+      { id: 'pending', content: `Pending (${counts.pending})`, panelID: 'pending-panel' },
+      { id: 'inProcess', content: `In process (${counts.inProcess})`, panelID: 'inProcess-panel' },
+      { id: 'error', content: `Errors (${counts.error})`, panelID: 'error-panel' },
+      { id: 'completed', content: `Completed (${counts.completed})`, panelID: 'completed-panel' },
+    ],
+    [counts],
+  );
+
+  const activeBucket: Bucket = useMemo(() => {
+    switch (activeTab) {
+      case 1:
+        return 'pending';
+      case 2:
+        return 'inProcess';
+      case 3:
+        return 'error';
+      case 4:
+        return 'completed';
+      default:
+        return 'all';
+    }
+  }, [activeTab]);
+
+  const filteredDomains = useMemo(() => {
+    if (activeBucket === 'all') return domains;
+    return domains.filter((d) => bucketForStatus(d.status) === activeBucket);
+  }, [activeBucket, domains]);
+
+  const dnsPreview: DnsInstructions | null = useMemo(() => {
+    if (!config) return null;
+    const d = coerceHostname(domainInput);
+    if (!d) return null;
+    return {
+      recordType: 'CNAME',
+      host: d,
+      value: config.cnameTarget,
+      note: 'Create this record with your DNS provider (registrar). DNS propagation may take a few minutes.',
+    };
+  }, [config, domainInput]);
+
+  function resetModal() {
+    setStep(1);
+    setDomainInput('');
+    setManualConfirmed(false);
+    setDomainConnectConfirmed(false);
+    setInfoBanner(null);
+    setErrorBanner(null);
+  }
+
+  const isDomainValid = !!coerceHostname(domainInput);
+
+  const submitEnabled = domainConnectConfirmed || manualConfirmed;
+
+  const tableRows = filteredDomains.map((d) => {
+    const domain = d.domain || '';
+    return [
+      <Button
+        key={`sel-${domain}`}
+        variant="plain"
+        onClick={() => setSelectedDomain(domain)}
+        disabled={!domain}
+      >
+        {domain || '—'}
+      </Button>,
+      <Button
+        key={`cname-${domain}`}
+        variant="plain"
+        onClick={() => setSelectedDomain(domain)}
+        disabled={!domain}
+      >
+        View
+      </Button>,
+      <Badge key={`badge-${domain}`} tone={toneForStatus(d.status)}>
+        {labelForStatus(d.status)}
+      </Badge>,
+      <Button
+        key={`details-${domain}`}
+        variant="plain"
+        onClick={() => setSelectedDomain(domain)}
+        disabled={!domain}
+      >
+        Details
+      </Button>,
+    ];
+  });
+
+  return (
+    <Page
+      title="Apple Pay Domains"
+      subtitle={shopInfo?.shopName ? `Shop: ${shopInfo.shopName}` : undefined}
+      primaryAction={{
+        content: 'Add Domain',
+        onAction: () => {
+          resetModal();
+          setAddOpen(true);
+          // pre-fill with suggested domain if available
+          if (shopInfo?.primaryDomain) setDomainInput(shopInfo.primaryDomain);
+        },
+      }}
+    >
+      <BlockStack gap="400">
+        {infoBanner && (
+          <Banner tone="success" onDismiss={() => setInfoBanner(null)}>
+            {infoBanner}
+          </Banner>
+        )}
+        {errorBanner && (
+          <Banner tone="critical" onDismiss={() => setErrorBanner(null)}>
+            {errorBanner}
+          </Banner>
+        )}
+
+        <Layout>
+          {/* CENTER: domains table */}
+          <Layout.Section>
+            <Card roundedAbove="sm">
+              <Tabs tabs={tabs} selected={activeTab} onSelect={setActiveTab}>
+                <Box padding="400">
+                  <BlockStack gap="300">
+                    <Text as="p" tone="subdued">
+                      Domains are auto-refreshed every 5 seconds.
+                    </Text>
+
+                    <DataTable
+                      columnContentTypes={['text', 'text', 'text', 'text']}
+                      headings={['Domain', 'CNAME', 'Status', 'Details']}
+                      rows={tableRows}
+                    />
+
+                    {filteredDomains.length === 0 && (
+                      <Text as="p" tone="subdued">
+                        No domains in this view.
+                      </Text>
+                    )}
+                  </BlockStack>
+                </Box>
+              </Tabs>
+            </Card>
+          </Layout.Section>
+
+          {/* RIGHT: details sidebar */}
+          <Layout.Section variant="oneThird">
+            <Card roundedAbove="sm">
+              <Box padding="400">
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Domain details
+                  </Text>
+
+                  {!selected ? (
+                    <Text as="p" tone="subdued">
+                      Select a domain from the table to view the CNAME and status details.
+                    </Text>
+                  ) : (
+                    <>
+                      <BlockStack gap="100">
+                        <Text as="p" variant="bodyMd">
+                          <strong>{selected.domain}</strong>
+                        </Text>
+                        <Text as="p" tone="subdued">
+                          Status: {labelForStatus(selected.status)}
+                        </Text>
+                      </BlockStack>
+
+                      <Divider />
+
+                      <BlockStack gap="200">
+                        <Text as="h3" variant="headingSm">
+                          CNAME record
+                        </Text>
+
+                        {selected.dnsInstructions ? (
+                          <Box padding="300" background="bg-surface-secondary" borderRadius="200">
+                            <BlockStack gap="100">
+                              <Text as="p" variant="bodySm">
+                                <strong>Type:</strong> {selected.dnsInstructions.recordType}
+                              </Text>
+                              <Text as="p" variant="bodySm">
+                                <strong>Host:</strong> {selected.dnsInstructions.host}
+                              </Text>
+                              <Text as="p" variant="bodySm">
+                                <strong>Value:</strong> {selected.dnsInstructions.value}
+                              </Text>
+                              {selected.dnsInstructions.note && (
+                                <Text as="p" tone="subdued" variant="bodySm">
+                                  {selected.dnsInstructions.note}
+                                </Text>
+                              )}
+                            </BlockStack>
+                          </Box>
+                        ) : (
+                          <Text as="p" tone="subdued">
+                            No DNS instructions available.
+                          </Text>
+                        )}
+                      </BlockStack>
+
+                      <Divider />
+
+                      <BlockStack gap="200">
+                        <Text as="h3" variant="headingSm">
+                          System status
+                        </Text>
+                        <Text as="p" variant="bodySm">
+                          <strong>Cloudflare hostname status:</strong>{' '}
+                          {selected.cloudflareHostnameStatus || '—'}
+                        </Text>
+                        <Text as="p" variant="bodySm">
+                          <strong>Cloudflare SSL status:</strong> {selected.cloudflareSslStatus || '—'}
+                        </Text>
+                        <Text as="p" variant="bodySm">
+                          <strong>Last Apple check:</strong> {selected.appleLastCheckedAt || '—'}
+                        </Text>
+
+                        {selected.lastError && (
+                          <Banner tone="critical" title="Last error">
+                            <Text as="p" variant="bodySm">
+                              {selected.lastError}
+                            </Text>
+                          </Banner>
+                        )}
+                      </BlockStack>
+
+                      <InlineStack gap="200">
+                        <Button onClick={() => refreshDomains()} disabled={busy}>
+                          Refresh now
+                        </Button>
+                        <Button
+                          variant="primary"
+                          onClick={() => onboardDomain(String(selected.domain))}
+                          loading={busy}
+                        >
+                          Retry onboarding
+                        </Button>
+                      </InlineStack>
+                    </>
+                  )}
+                </BlockStack>
+              </Box>
+            </Card>
+          </Layout.Section>
+        </Layout>
+      </BlockStack>
+
+      {/* Add Domain Modal */}
+      <Modal
+        open={addOpen}
+        onClose={() => {
+          setAddOpen(false);
+          resetModal();
+        }}
+        title={step === 1 ? 'Add a domain' : 'Connect your DNS'}
+        primaryAction={
+          step === 1
+            ? {
+                content: 'Next',
+                onAction: () => setStep(2),
+                disabled: !isDomainValid,
+              }
+            : {
+                content: 'Submit',
+                onAction: async () => {
+                  const d = coerceHostname(domainInput);
+                  if (!d) return;
+                  await onboardDomain(d);
+                  setAddOpen(false);
+                  resetModal();
+                  await refreshDomains();
+                  setSelectedDomain(d);
+                },
+                disabled: !submitEnabled,
+                loading: busy,
+              }
+        }
+        secondaryActions={
+          step === 1
+            ? [
+                {
+                  content: 'Cancel',
+                  onAction: () => {
+                    setAddOpen(false);
+                    resetModal();
+                  },
+                },
+              ]
+            : [
+                {
+                  content: 'Back',
+                  onAction: () => {
+                    setStep(1);
+                    setManualConfirmed(false);
+                    setDomainConnectConfirmed(false);
+                  },
+                },
+                {
+                  content: 'Cancel',
+                  onAction: () => {
+                    setAddOpen(false);
+                    resetModal();
+                  },
+                },
+              ]
+        }
+      >
+        <Modal.Section>
+          {step === 1 ? (
+            <BlockStack gap="300">
+              <TextField
+                label="Domain"
+                value={domainInput}
+                onChange={setDomainInput}
+                autoComplete="off"
+                helpText="Enter the exact hostname you want to enable Apple Pay for (e.g. dev.example.com)."
+              />
+
+              {shopInfo?.primaryDomain && (
+                <Box>
+                  <Text as="p" tone="subdued">
+                    Suggested:
+                  </Text>
+                  <Button
+                    variant="plain"
+                    onClick={() => setDomainInput(shopInfo.primaryDomain || '')}
+                  >
+                    Use {shopInfo.primaryDomain}
+                  </Button>
+                </Box>
+              )}
+            </BlockStack>
+          ) : (
+            <BlockStack gap="300">
+              <Text as="p" tone="subdued">
+                Add this DNS record at your registrar/DNS provider. Then confirm below.
+              </Text>
+
+              {dnsPreview ? (
+                <Box padding="300" background="bg-surface-secondary" borderRadius="200">
+                  <BlockStack gap="100">
+                    <Text as="p" variant="bodySm">
+                      <strong>Type:</strong> {dnsPreview.recordType}
+                    </Text>
+                    <Text as="p" variant="bodySm">
+                      <strong>Host:</strong> {dnsPreview.host}
+                    </Text>
+                    <Text as="p" variant="bodySm">
+                      <strong>Value:</strong> {dnsPreview.value}
+                    </Text>
+                    {dnsPreview.note && (
+                      <Text as="p" tone="subdued" variant="bodySm">
+                        {dnsPreview.note}
+                      </Text>
+                    )}
+                  </BlockStack>
+                </Box>
+              ) : (
+                <Banner tone="critical">Missing DNS instructions (check config / domain).</Banner>
+              )}
+
+              <Divider />
+
+              <BlockStack gap="200">
+                <Text as="h3" variant="headingSm">
+                  Automatic 1‑click (Domain Connect)
+                </Text>
+                <Text as="p" tone="subdued">
+                  Coming next: we’ll detect your registrar and show the correct 1‑click setup button.
+                </Text>
+
+                <Button disabled>Connect automatically</Button>
+
+                {/* In the future: when redirected back from Domain Connect, setDomainConnectConfirmed(true) */}
+              </BlockStack>
+
+              <Divider />
+
+              <Checkbox
+                label="I added the CNAME record manually"
+                checked={manualConfirmed}
+                onChange={setManualConfirmed}
+              />
+
+              <Text as="p" tone="subdued">
+                Submit stays disabled until you either complete the 1‑click flow or confirm manual DNS.
+              </Text>
+            </BlockStack>
+          )}
+        </Modal.Section>
+      </Modal>
+    </Page>
+  );
 }
 
 export default function App() {
@@ -55,326 +695,85 @@ export default function App() {
 
   const [config, setConfig] = useState<Config | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
-  const [shopInfo, setShopInfo] = useState<ShopInfo | null>(null);
-  const [status, setStatus] = useState<ApplePayStatus | null>(null);
-  const [busy, setBusy] = useState<boolean>(false);
-  const [infoBanner, setInfoBanner] = useState<string | null>(null);
-  const [errorBanner, setErrorBanner] = useState<string | null>(null);
+
+  async function loadConfig() {
+    try {
+      const res = await fetch('/api/config', { headers: { Accept: 'application/json' } });
+      const json = (await res.json()) as Config | ApiErrorBody;
+      if (!res.ok) {
+        const error = json as ApiErrorBody;
+        throw new Error(error?.error || `Failed to load config (${res.status})`);
+      }
+      setConfig(json as Config);
+    } catch (e: unknown) {
+      setConfigError(e instanceof Error ? e.message : String(e));
+    }
+  }
 
   useEffect(() => {
-    (async () => {
-      try {
-        const res = await fetch('/api/config', { headers: { Accept: 'application/json' } });
-        if (!res.ok) throw new Error(`Failed to load config (${res.status})`);
-        const json = (await res.json()) as Config;
-        setConfig(json);
-      } catch (e: unknown) {
-        setConfigError(e instanceof Error ? e.message : String(e));
-      }
-    })();
+    loadConfig();
   }, []);
 
-  const appBridge = useMemo(() => {
-    if (!config || !host || !shop) return null;
-    return createApp({
+  const appBridgeConfig = useMemo(() => {
+    if (!config || !host) return null;
+    return {
       apiKey: config.shopifyApiKey,
       host,
       forceRedirect: true,
-    });
-  }, [config, host, shop]);
-
-  // App Bridge-aware fetch that injects a fresh session token automatically.
-  const appFetch = useMemo(() => {
-    if (!appBridge) return null;
-    return authenticatedFetch(appBridge);
-  }, [appBridge]);
-
-  async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
-    if (!appFetch) throw new Error('App Bridge is not initialized (missing host/shop).');
-    const res = await appFetch(path, {
-      ...init,
-      headers: {
-        Accept: 'application/json',
-        ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-        ...(init?.headers ?? {}),
-      },
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      let data: unknown = null;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        data = null;
-      }
-      const messageFromBody =
-        data && typeof data === 'object' && 'error' in data ? String((data as { error?: unknown }).error) : '';
-      const err = new Error(
-        `${path} failed (${res.status}): ${messageFromBody || text || res.statusText}`,
-      ) as Error & { status: number; body: string; data?: unknown };
-      err.status = res.status;
-      err.body = text;
-      err.data = data;
-      throw err;
-    }
-    return (await res.json()) as T;
-  }
-
-
-  function reauthenticate(reason?: string) {
-    if (!config || !shop || !host) return;
-    setInfoBanner(reason ?? 'Re-authenticating with Shopify…');
-
-    const url = new URL('/auth', config.appUrl);
-    url.searchParams.set('shop', shop);
-    url.searchParams.set('host', host);
-
-    // Prefer App Bridge's REMOTE redirect (official embedded-app way).
-    try {
-      if (appBridge) {
-        const redirect = Redirect.create(appBridge);
-        redirect.dispatch(Redirect.Action.REMOTE, url.toString());
-        return;
-      }
-    } catch {
-      // fall through
-    }
-
-    // Fallback: hard top-level navigation (works even if App Bridge isn't ready).
-    try {
-      if (window.top) {
-        window.top.location.href = url.toString();
-      } else {
-        window.location.href = url.toString();
-      }
-    } catch {
-      window.location.href = url.toString();
-    }
-  }
-
-  async function refresh() {
-    setBusy(true);
-    setErrorBanner(null);
-    setInfoBanner(null);
-    try {
-      const shopData = await apiJson<ShopInfo>('/api/shop');
-      setShopInfo(shopData);
-      const qs = shopData.primaryDomain
-        ? `?domain=${encodeURIComponent(shopData.primaryDomain)}`
-        : '';
-      const statusData = await apiJson<ApplePayStatus>(`/api/applepay/status${qs}`);
-      setStatus(statusData);
-    } catch (e: unknown) {
-      const statusCode = e && typeof e === 'object' && 'status' in e ? (e as { status: number }).status : undefined;
-      const msg = e instanceof Error ? e.message : String(e);
-      // If the shop is not in our DB yet (fresh D1, reinstall, etc.), kick off OAuth.
-      if (statusCode === 401) {
-        reauthenticate('Shop needs authentication. Redirecting to Shopify…');
-        return;
-      }
-      setErrorBanner(msg);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  useEffect(() => {
-    if (!appBridge) return;
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appBridge]);
-
-  async function onboard() {
-    setBusy(true);
-    setErrorBanner(null);
-    setInfoBanner(null);
-    try {
-      const res = await apiJson<ApplePayStatus>('/api/applepay/onboard', { method: 'POST' });
-      setStatus(res);
-      if (res.status === 'VERIFIED') {
-        setInfoBanner('✅ Apple Pay domain verification is complete.');
-      } else {
-        setInfoBanner('Onboarding started. Follow the instructions below, then click Refresh.');
-      }
-    } catch (e: unknown) {
-      const err = e as (Error & { data?: unknown });
-      if (err?.data && typeof err.data === 'object') {
-        const data = err.data as Partial<ApplePayStatus>;
-        if (data.dnsInstructions || data.status || data.domain) {
-          setStatus(data as ApplePayStatus);
-          if (data.dnsInstructions) {
-            setInfoBanner('DNS setup required. Follow the instructions below, then click Refresh.');
-          }
-        }
-      }
-      setErrorBanner(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
+    };
+  }, [config, host]);
 
   if (!shop || !host) {
     return (
-      <Page title="Apple Pay Enablement">
-        <Card>
-          <BlockStack gap="400">
-            <Text as="p">
-              This app must be opened from within Shopify Admin.
-            </Text>
-            <Text as="p" tone="subdued">
-              Missing <Text as="span" fontWeight="bold">shop</Text> or{' '}
-              <Text as="span" fontWeight="bold">host</Text> URL parameters.
-            </Text>
-          </BlockStack>
-        </Card>
+      <Page title="Apple Pay Domains">
+        <Banner tone="critical" title="Missing required parameters">
+          This embedded app must be opened from Shopify Admin (missing <code>shop</code> or <code>host</code>).
+        </Banner>
       </Page>
     );
   }
 
   if (configError) {
     return (
-      <Page title="Apple Pay Enablement">
-        <Banner tone="critical" title="Failed to load app configuration">
-          <p>{configError}</p>
+      <Page title="Apple Pay Domains">
+        <Banner tone="critical" title="Failed to load app config">
+          {configError}
         </Banner>
       </Page>
     );
   }
 
-  if (!config || !appBridge) {
+  if (!config) {
     return (
-      <Page title="Apple Pay Enablement">
-        <InlineStack gap="300" align="center" blockAlign="center">
-          <Spinner size="small" />
-          <Text as="p">Loading…</Text>
-        </InlineStack>
+      <Page title="Apple Pay Domains">
+        <Card>
+          <Box padding="400">
+            <Text as="p">Loading…</Text>
+          </Box>
+        </Card>
       </Page>
     );
   }
 
-  const primaryDomain = shopInfo?.primaryDomain ?? null;
+  if (!appBridgeConfig) {
+    return (
+      <Page title="Apple Pay Domains">
+        <Card>
+          <Box padding="400">
+            <Text as="p">Loading…</Text>
+          </Box>
+        </Card>
+      </Page>
+    );
+  }
 
-  return (
-    <Page
-      title="Apple Pay Enablement"
-      subtitle={shopInfo ? `${shopInfo.shopName} (${shopInfo.shop})` : shop}
-      primaryAction={
-        <Button onClick={refresh} disabled={busy}>
-          Refresh
-        </Button>
-      }
-    >
-      <Layout>
-        <Layout.Section>
-          {errorBanner ? (
-            <Banner tone="critical" title="Error">
-              <p>{errorBanner}</p>
-            </Banner>
-          ) : null}
+if (!appBridgeConfig) {
+  return <div>Loading Shopify App...</div>; // Or return null to render nothing
+}
 
-          {infoBanner ? (
-            <Banner tone="success" title="Update">
-              <p>{infoBanner}</p>
-            </Banner>
-          ) : null}
-
-          <Card>
-            <BlockStack gap="400">
-              <Text as="h2" variant="headingMd">
-                Current Store Domain
-              </Text>
-              <Text as="p">
-                Primary domain:{' '}
-                <Text as="span" fontWeight="bold">
-                  {primaryDomain ?? 'No custom domain set'}
-                </Text>
-              </Text>
-              <Divider />
-              <InlineStack gap="300" align="start">
-                <Button variant="primary" onClick={onboard} disabled={busy || !primaryDomain}>
-                  Enable Apple Pay
-                </Button>
-                {!primaryDomain ? (
-                  <Text as="p" tone="subdued">
-                    Set a primary custom domain in Shopify before enabling Apple Pay.
-                  </Text>
-                ) : null}
-              </InlineStack>
-            </BlockStack>
-          </Card>
-
-          <Card>
-            <BlockStack gap="400">
-              <Text as="h2" variant="headingMd">
-                Status
-              </Text>
-              {!status ? (
-                <InlineStack gap="300" align="start" blockAlign="center">
-                  <Spinner size="small" />
-                  <Text as="p">Loading status…</Text>
-                </InlineStack>
-              ) : (
-                <BlockStack gap="300">
-                  <Text as="p">
-                    Domain: <Text as="span" fontWeight="bold">{status.domain ?? '—'}</Text>
-                  </Text>
-                  <Text as="p">
-                    Apple status: <Text as="span" fontWeight="bold">{status.status}</Text>
-                  </Text>
-                  <Text as="p">
-                    Cloudflare hostname: <Text as="span" fontWeight="bold">{status.cloudflareHostnameStatus ?? '—'}</Text>
-                  </Text>
-                  <Text as="p">
-                    Cloudflare SSL: <Text as="span" fontWeight="bold">{status.cloudflareSslStatus ?? '—'}</Text>
-                  </Text>
-                  {status.lastError ? (
-                    <Banner tone="warning" title="Last error">
-                      <p>{status.lastError}</p>
-                    </Banner>
-                  ) : null}
-
-                  {status.dnsInstructions ? (
-                    <Card>
-                      <BlockStack gap="200">
-                        <Text as="h3" variant="headingSm">
-                          DNS instructions
-                        </Text>
-                        <Text as="p">
-                          Add a <Text as="span" fontWeight="bold">{status.dnsInstructions.recordType}</Text> record:
-                        </Text>
-                        <List>
-                          <List.Item>
-                            Host: <Text as="span" fontWeight="bold">{status.dnsInstructions.host}</Text>
-                          </List.Item>
-                          <List.Item>
-                            Value: <Text as="span" fontWeight="bold">{status.dnsInstructions.value}</Text>
-                          </List.Item>
-                        </List>
-                        {status.dnsInstructions.note ? (
-                          <Text as="p" tone="subdued">
-                            {status.dnsInstructions.note}
-                          </Text>
-                        ) : null}
-                        <Text as="p" tone="subdued">
-                          After DNS propagates, click <Text as="span" fontWeight="bold">Refresh</Text>, then click{' '}
-                          <Text as="span" fontWeight="bold">Enable Apple Pay</Text> again.
-                        </Text>
-                      </BlockStack>
-                    </Card>
-                  ) : null}
-
-                  <Text as="p" tone="subdued">
-                    Need help? Contact support and include your shop domain ({shop}).
-                  </Text>
-                  <Text as="p" tone="subdued">
-                    App URL: <Link url={config.appUrl} target="_blank">{config.appUrl}</Link>
-                  </Text>
-                </BlockStack>
-              )}
-            </BlockStack>
-          </Card>
-        </Layout.Section>
-      </Layout>
-    </Page>
-  );
+return (
+  <AppBridgeProvider config={appBridgeConfig}>
+    <AppContent config={config} />
+  </AppBridgeProvider>
+);
 }
