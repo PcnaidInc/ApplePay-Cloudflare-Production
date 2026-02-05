@@ -82,10 +82,13 @@ export function extractShopFromPayload(payload: ShopifySessionPayload): string {
 export function isXhrRequest(headers: Headers): boolean {
   const accept = headers.get('accept') || '';
   const xRequestedWith = headers.get('x-requested-with') || '';
-  
-  // XHR/fetch typically accept JSON or have X-Requested-With header
+  const authorization = headers.get('authorization') || '';
+  const hasBearerAuth = /^bearer\s+.+/i.test(authorization);
+
+  // XHR/fetch typically accept JSON, have X-Requested-With header, or use Bearer auth
   return (
     accept.includes('application/json') ||
-    xRequestedWith.toLowerCase() === 'xmlhttprequest'
+    xRequestedWith.toLowerCase() === 'xmlhttprequest' ||
+    hasBearerAuth
   );
 }
