@@ -20,10 +20,26 @@ async function hasColumn(db: D1Database, table: string, column: string): Promise
   return cols.some((c) => c.name === column);
 }
 
-async function addColumnIfMissing(db: D1Database, table: string, ddl: string, columnName: string): Promise<void> {
+async function addColumnIfMissing(
+  db: D1Database,
+  table: string,
+  ddl: string,
+  columnName: string
+): Promise<void> {
+  // Fast path: already present.
   if (await hasColumn(db, table, columnName)) return;
-  await db.exec(ddl);
+
+  try {
+    await db.exec(ddl);
+  } catch (err) {
+    // Race safety: another isolate/request may have added the column after our check.
+    if (await hasColumn(db, table, columnName)) return;
+
+    // Still missing? Then it's a real failure.
+    throw err;
+  }
 }
+
 
 export function ensureSchema(db: D1Database): Promise<void> {
   if (_ensured) return _ensured;

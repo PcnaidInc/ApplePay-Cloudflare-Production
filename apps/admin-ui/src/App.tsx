@@ -1,5 +1,5 @@
 // FILE: apps/admin-ui/src/App.tsx
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AppBridgeProvider } from './context/appBridge';
 import { useAuthenticatedFetch } from './hooks/useAuthenticatedFetch';
 import {
@@ -143,6 +143,11 @@ function toneForStatus(status: string): 'success' | 'info' | 'attention' | 'crit
   }
 }
 
+// Smart polling tuning
+const POLL_FAST_MS = 5_000; // 5s when “busy”
+const POLL_IDLE_MS = 12 * 60 * 60 * 1000; // 12h when “idle”
+const POLL_MAX_BACKOFF_MS = 60_000; // cap backoff at 60s
+
 function AppContent({ config }: { config: Config }) {
   const authenticatedFetch = useAuthenticatedFetch();
 
@@ -167,71 +172,89 @@ function AppContent({ config }: { config: Config }) {
   const autoRetryDomains = useRef<Set<string>>(new Set());
   const retryState = useRef<Record<string, { inFlight: boolean; lastAttemptMs: number }>>({});
 
-  async function apiFetch(path: string, opts: RequestInit = {}): Promise<Response> {
-    return authenticatedFetch(path, opts);
-  }
+    // Polling/backoff state (persists across renders)
+  const failureCount = useRef(0);
+  const pollTimeoutId = useRef<number | null>(null);
 
-  async function apiJson<T>(path: string, opts: RequestInit = {}): Promise<T> {
-    const res = await apiFetch(path, opts);
-    const text = await res.text();
-    const json = text ? JSON.parse(text) : null;
-    if (!res.ok) {
-      const body = json as ApiErrorBody | null;
-      throw new ApiError(body?.error || `Request failed (${res.status})`, res.status, body?.details);
-    }
-    return json as T;
-  }
+    const apiFetch = useCallback(
+    (path: string, opts: RequestInit = {}): Promise<Response> => authenticatedFetch(path, opts),
+    [authenticatedFetch],
+  );
 
-  async function refreshShopInfo() {
+  const apiJson = useCallback(
+    async function apiJson<T>(path: string, opts: RequestInit = {}): Promise<T> {
+      const res = await apiFetch(path, opts);
+      const text = await res.text();
+      const json = text ? JSON.parse(text) : null;
+      if (!res.ok) {
+        const body = json as ApiErrorBody | null;
+        throw new ApiError(body?.error || `Request failed (${res.status})`, res.status, body?.details);
+      }
+      return json as T;
+    },
+    [apiFetch],
+  );
+
+  const refreshShopInfo = useCallback(async () => {
     const info = await apiJson<ShopInfo>('/api/shop');
     setShopInfo(info);
-  }
+  }, [apiJson]);
 
-  async function refreshDomains() {
+  // IMPORTANT: this now RETURNS the latest list so polling can make decisions immediately
+  const refreshDomains = useCallback(async (): Promise<ApplePayDomain[]> => {
     const res = await apiJson<DomainsResponse>('/api/applepay/domains');
-    setDomains(res.domains || []);
-    // keep selection valid
-    if (selectedDomain) {
-      const stillThere = (res.domains || []).some((d) => d.domain === selectedDomain);
-      if (!stillThere) setSelectedDomain(null);
-    }
-  }
+    const next = res.domains || [];
 
-  async function onboardDomain(domain: string, { silent = false }: { silent?: boolean } = {}) {
-    const normalized = coerceHostname(domain);
-    if (!normalized) return;
+    setDomains(next);
 
-    try {
-      if (!silent) setBusy(true);
-      const updated = await apiJson<ApplePayDomain>('/api/applepay/onboard', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ domain: normalized }),
-      });
+    // keep selection valid without needing selectedDomain in deps
+    setSelectedDomain((prev) => {
+      if (!prev) return prev;
+      return next.some((d) => d.domain === prev) ? prev : null;
+    });
 
-      setDomains((prev) => {
-        const next = [...prev];
-        const idx = next.findIndex((d) => d.domain === updated.domain);
-        if (idx >= 0) next[idx] = { ...next[idx], ...updated };
-        else next.unshift(updated);
-        return next;
-      });
+    return next;
+  }, [apiJson]);
 
-      if (!silent) setInfoBanner(`Onboarding started for ${normalized}`);
-      setErrorBanner(null);
+  const onboardDomain = useCallback(
+    async (domain: string, { silent = false }: { silent?: boolean } = {}) => {
+      const normalized = coerceHostname(domain);
+      if (!normalized) return;
 
-      // enable auto-retry for this domain
-      autoRetryDomains.current.add(normalized);
-    } catch (e: unknown) {
-      if (!silent) setErrorBanner(e instanceof Error ? e.message : String(e));
-    } finally {
-      if (!silent) setBusy(false);
-    }
-  }
+      try {
+        if (!silent) setBusy(true);
 
-  // When app bridge becomes ready, load shop + domains
+        const updated = await apiJson<ApplePayDomain>('/api/applepay/onboard', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ domain: normalized }),
+        });
+
+        setDomains((prev) => {
+          const next = [...prev];
+          const idx = next.findIndex((d) => d.domain === updated.domain);
+          if (idx >= 0) next[idx] = { ...next[idx], ...updated };
+          else next.unshift(updated);
+          return next;
+        });
+
+        if (!silent) setInfoBanner(`Onboarding started for ${normalized}`);
+        setErrorBanner(null);
+
+        // enable auto-retry for this domain
+        autoRetryDomains.current.add(normalized);
+      } catch (e: unknown) {
+        if (!silent) setErrorBanner(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!silent) setBusy(false);
+      }
+    },
+    [apiJson],
+  );
+
+   // When app bridge becomes ready, load shop + domains
   useEffect(() => {
     (async () => {
       try {
@@ -241,41 +264,98 @@ function AppContent({ config }: { config: Config }) {
         setErrorBanner(e instanceof Error ? e.message : String(e));
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authenticatedFetch]);
+  }, [refreshShopInfo, refreshDomains]);
 
-  // Poll every 5 seconds (status refresh)
+
+    // Smart polling:
+  // - 5s when any domain is active (waiting on Apple/DNS/etc.) OR when session-submitted domains are retrying
+  // - 12h when idle (0 domains or all VERIFIED/UNREGISTERED)
+  // - exponential backoff up to 60s when the backend is failing
   useEffect(() => {
-    const id = window.setInterval(() => {
-      refreshDomains().catch(() => {
-        // keep quiet on polling errors
-      });
+    let cancelled = false;
 
-      // Auto-retry for domains submitted during this session (every ~5s)
-      const now = Date.now();
-      for (const d of autoRetryDomains.current) {
-        const state = retryState.current[d] || { inFlight: false, lastAttemptMs: 0 };
-        if (state.inFlight) continue;
-        if (now - state.lastAttemptMs < 5000) continue;
-
-        const current = domains.find((x) => x.domain === d);
-        if (!current) continue;
-        if (current.status === 'VERIFIED' || current.status === 'UNREGISTERED') continue;
-
-        retryState.current[d] = { inFlight: true, lastAttemptMs: now };
-        onboardDomain(d, { silent: true })
-          .catch(() => {
-            // Silently ignore retry errors to avoid disrupting the polling loop
-          })
-          .finally(() => {
-            retryState.current[d] = { inFlight: false, lastAttemptMs: now };
-          });
+    const clearTimer = () => {
+      if (pollTimeoutId.current != null) {
+        window.clearTimeout(pollTimeoutId.current);
+        pollTimeoutId.current = null;
       }
-    }, 5000);
+    };
 
-    return () => window.clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authenticatedFetch, domains]);
+    const isTerminal = (status: string) => status === 'VERIFIED' || status === 'UNREGISTERED';
+    const isActive = (status: string) => !isTerminal(status);
+
+    const poll = async () => {
+      if (cancelled) return;
+
+      let nextDelay = POLL_IDLE_MS; // default idle
+
+      try {
+        // refreshDomains() returns the latest list now (important!)
+        const latestDomains = await refreshDomains();
+
+        // Success → reset backoff
+        failureCount.current = 0;
+
+        // “Neediest domain” logic: if ANY domain is active, stay in fast mode.
+        const hasActiveServerDomains = latestDomains.some((d) => isActive(d.status));
+
+        // If ANY session-submitted domain is still active (or hasn't appeared yet), stay in fast mode.
+        let hasPendingRetries = false;
+        for (const domainName of autoRetryDomains.current) {
+          const d = latestDomains.find((x) => x.domain === domainName);
+          if (!d || isActive(d.status)) {
+            hasPendingRetries = true;
+            break;
+          }
+        }
+
+        nextDelay = hasActiveServerDomains || hasPendingRetries ? POLL_FAST_MS : POLL_IDLE_MS;
+
+        // Auto-retry only while busy
+        if (nextDelay === POLL_FAST_MS) {
+          const now = Date.now();
+
+          for (const domainName of autoRetryDomains.current) {
+            const state = retryState.current[domainName] || { inFlight: false, lastAttemptMs: 0 };
+            if (state.inFlight) continue;
+            if (now - state.lastAttemptMs < POLL_FAST_MS) continue;
+
+            const current = latestDomains.find((x) => x.domain === domainName);
+            if (current && isTerminal(current.status)) continue; // done → stop retrying this one
+
+            retryState.current[domainName] = { inFlight: true, lastAttemptMs: now };
+
+            onboardDomain(domainName, { silent: true })
+              .catch(() => {
+                // quiet: keep polling loop alive
+              })
+              .finally(() => {
+                retryState.current[domainName] = {
+                  ...retryState.current[domainName],
+                  inFlight: false,
+                };
+              });
+          }
+        }
+      } catch {
+        // Failure → exponential backoff up to 60s
+        failureCount.current += 1;
+        nextDelay = Math.min(POLL_FAST_MS * 2 ** failureCount.current, POLL_MAX_BACKOFF_MS);
+      } finally {
+        if (!cancelled) {
+          clearTimer();
+          pollTimeoutId.current = window.setTimeout(() => void poll(), nextDelay);
+        }
+      }
+    };
+
+    void poll();
+
+    return () => {
+      cancelled = true;
+      clearTimer();
+    };
+  }, [refreshDomains, onboardDomain]);
 
   const selected = useMemo(() => {
     if (!selectedDomain) return null;
@@ -755,25 +835,23 @@ export default function App() {
     );
   }
 
+
   if (!appBridgeConfig) {
     return (
       <Page title="Apple Pay Domains">
         <Card>
           <Box padding="400">
-            <Text as="p">Loading…</Text>
+            <Text as="p">Loading...</Text>
           </Box>
         </Card>
       </Page>
     );
   }
 
-if (!appBridgeConfig) {
-  return <div>Loading Shopify App...</div>; // Or return null to render nothing
+  return (
+    <AppBridgeProvider config={appBridgeConfig}>
+      <AppContent config={config} />
+    </AppBridgeProvider>
+  );
 }
 
-return (
-  <AppBridgeProvider config={appBridgeConfig}>
-    <AppContent config={config} />
-  </AppBridgeProvider>
-);
-}

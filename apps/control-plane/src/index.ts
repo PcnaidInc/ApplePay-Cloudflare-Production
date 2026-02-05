@@ -1,6 +1,3 @@
-import { trace } from '@opentelemetry/api';
-import { instrument, ResolveConfigFn } from '@microlabs/otel-cf-workers';
-
 import { Hono } from 'hono';
 import { setCookie, getCookie, deleteCookie } from 'hono/cookie';
 import { cors } from 'hono/cors';
@@ -48,6 +45,21 @@ import {
   randomState,
   sha256Hex,
 } from './lib/util';
+import { ensureSchema } from "./lib/schema";
+
+let _schemaEnsured: Promise<void> | null = null;
+
+function ensureSchemaOnce(db: D1Database): Promise<void> {
+  if (_schemaEnsured) return _schemaEnsured;
+
+  _schemaEnsured = ensureSchema(db).catch((err) => {
+    // Allow retry if schema init fails
+    _schemaEnsured = null;
+    throw err;
+  });
+
+  return _schemaEnsured;
+}
 
 
 // -----------------------------------------------------------------------------
@@ -154,11 +166,6 @@ type Env = {
   APPLE_JWT_CERT_PEM: string;
   APPLE_JWT_PRIVATE_KEY_PEM: string;
   APPLE_VERIFICATION_KV_KEY?: string;
-
-  // OpenTelemetry
-  OTEL_EXPORTER_OTLP_ENDPOINT?: string;
-  OTEL_EXPORTER_OTLP_HEADERS?: string;
-  OTEL_SERVICE_NAME?: string;
 };
 
 type ShopifySessionPayload = {
@@ -230,6 +237,7 @@ const OAUTH_STATE_COOKIE = '__applepay_oauth_state';
 
 // Global middleware for request tracking and correlation
 app.use('*', async (c, next) => {
+
   // Prefer inbound correlation headers, else fall back to cf-ray, else generate.
   const requestId =
     c.req.header('x-request-id') ||
@@ -248,6 +256,13 @@ app.use('*', async (c, next) => {
   const started = Date.now();
 
   try {
+    // Skip schema check for routes that don't need DB access
+    const url = new URL(c.req.url);
+    const skipSchemaRoutes = ['/api/config', '/.well-known/'];
+    const needsSchema = !skipSchemaRoutes.some(r => url.pathname.startsWith(r));
+    if (needsSchema) {
+      await ensureSchemaOnce(c.env.DB);
+    }
     await next();
   } finally {
     // Correlation headers back to the client
@@ -266,6 +281,9 @@ app.use('*', async (c, next) => {
 
 function isAppHost(env: Env, url: URL): boolean {
   try {
+    if (url.hostname.endsWith('.workers.dev') || url.hostname === 'localhost' || url.hostname === '127.0.0.1') {
+      return true;
+    }
     const appHost = new URL(env.SHOPIFY_APP_URL).hostname;
     return url.hostname === appHost;
   } catch {
@@ -413,11 +431,13 @@ async function proxyMerchantTrafficToShopify(c: any, u: URL): Promise<Response> 
     return await getMerchantDomainByDomain(c.env.DB, `www.${host}`);
   });
 
-  // If we don't recognize the hostname, just fall back to the default fetch.
-  if (!row) {
-    logEvent(c, 'warn', 'proxy.unknownDomain', { domain: host });
-    return fetch(c.req.raw);
-  }
+// If we don't recognize the hostname, DO NOT fall back to fetch(c.req.raw).
+// That can recurse back into this Worker (especially in dev) and cause a 500 loop.
+if (!row) {
+  logEvent(c, 'warn', 'proxy.unknownDomain', { domain: host });
+  return c.text(`Unknown domain: ${host}`, 404);
+}
+
 
   // Proxy to Shopify but preserve the original Host header so Shopify routes
   // the request as a custom domain storefront.
@@ -522,6 +542,21 @@ app.post(
 // App-host routes (Shopify embedded app)
 // -----------------------------------------------------------------------------
 
+app.get('/api/debug/runtime', async (c) => {
+  const u = new URL(c.req.url);
+  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
+
+  return c.json(
+    {
+      appleEnv: c.env.APPLE_ENV,   // "production" or "sandbox"
+      hasDB: !!c.env.DB,           // should be true
+      hasKV: !!c.env.APPLEPAY_KV,  // should be true
+    },
+    200,
+    { ...noStoreHeaders() },
+  );
+});
+
 // Config for the React admin UI (Shopify App Bridge needs apiKey + host).
 app.get('/api/config', async (c) => {
   const u = new URL(c.req.url);
@@ -592,70 +627,139 @@ app.get('/auth', async (c) => {
   return c.redirect(authorizeUrl, 302);
 });
 
-// OAuth callback
-app.get('/auth/callback', async (c) => {
+app.get("/auth/callback", async (c) => {
   const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
+  if (!isAppHost(c.env, u)) return c.text("Not Found", 404);
 
-  const shop = (u.searchParams.get('shop') || '').trim();
-  const host = (u.searchParams.get('host') || '').trim();
-  const code = (u.searchParams.get('code') || '').trim();
-  const state = (u.searchParams.get('state') || '').trim();
+  const shop = normalizeShopParam(u.searchParams.get("shop") || "");
+  const host = (u.searchParams.get("host") || "").trim();
+  const code = (u.searchParams.get("code") || "").trim();
+  const state = (u.searchParams.get("state") || "").trim();
 
   if (!shop || !host || !code || !state) {
-    return c.text('Missing OAuth callback parameters', 400);
+    return c.text("Missing OAuth callback parameters", 400);
   }
-  if (!(await verifyShopifyHmac({ url: u, apiSecret: c.env.SHOPIFY_API_SECRET }))) {
-    return c.text('Invalid HMAC', 400);
+  if (!isValidShopDomain(shop)) {
+    return c.text("Invalid shop parameter", 400);
   }
 
+  // HMAC validation
+  const ok = await verifyShopifyHmac({ url: u, apiSecret: c.env.SHOPIFY_API_SECRET });
+  if (!ok) return c.text("Invalid HMAC", 400);
+
+  // State validation
   const cookieState = getCookie(c, OAUTH_STATE_COOKIE);
   if (!cookieState || cookieState !== state) {
-    return c.text('Invalid OAuth state', 400);
+    // NOTE: This was happening after your 500 because you were deleting the cookie too early.
+    return c.text("Invalid OAuth state", 400);
   }
-  deleteCookie(c, OAUTH_STATE_COOKIE, { path: '/' });
 
-  const tokenRes = await exchangeAccessToken({
-    shop,
-    apiKey: c.env.SHOPIFY_API_KEY,
-    apiSecret: c.env.SHOPIFY_API_SECRET,
-    code,
-  });
-
-  const info = await getShopInfo({
-    shop,
-    accessToken: tokenRes.accessToken,
-    apiVersion: c.env.SHOPIFY_API_VERSION,
-  });
-
-  await upsertShop(c.env.DB, {
-    shop,
-    shopId: info.shopId,
-    shopName: info.name,
-    accessToken: tokenRes.accessToken,
-    scopes: tokenRes.scope,
-    installedAt: nowIso(),
-  });
-
-  // Keep install -> uninstall lifecycle clean.
+  // 1) Exchange token (must succeed)
+  let tokenRes: { accessToken: string; scope: string };
   try {
-    await registerAppUninstalledWebhook({
-      shop,
-      accessToken: tokenRes.accessToken,
-      apiVersion: c.env.SHOPIFY_API_VERSION,
-      callbackUrl: `${c.env.SHOPIFY_APP_URL}/webhooks/shopify/app-uninstalled`,
-    });
-  } catch (e: any) {
-    const message = e?.message || String(e);
-    if (!message.includes('Address for this topic has already been taken')) {
-      throw e;
-    }
-    console.warn('Webhook already registered. Skipping duplicate registration.');
+    tokenRes = await withStep(c, "shopify.exchangeAccessToken", () =>
+      exchangeAccessToken({
+        shop,
+        apiKey: c.env.SHOPIFY_API_KEY,
+        apiSecret: c.env.SHOPIFY_API_SECRET,
+        code,
+      }),
+    );
+  } catch (err) {
+    logEvent(c, "error", "oauth.exchange_failed", { error: safeError(err) });
+    // IMPORTANT: keep cookie so the error isn't followed by a guaranteed "Invalid OAuth state"
+    return c.text("Failed to exchange Shopify access token (check server logs)", 502);
   }
 
-  // Back into the embedded app.
-  return c.redirect(`${c.env.SHOPIFY_APP_URL}/?shop=${encodeURIComponent(shop)}&host=${encodeURIComponent(host)}`, 302);
+  // 2) Persist shop ASAP so the app is considered installed even if post-install steps fail
+  try {
+    await withStep(c, "db.upsertShop", () =>
+      upsertShop(c.env.DB, {
+        shop,
+        // Use safe placeholders; background task will replace them if getShopInfo works.
+        shopId: shop,
+        shopName: shop,
+        accessToken: tokenRes.accessToken,
+        scopes: tokenRes.scope,
+        installedAt: nowIso(),
+      }),
+    );
+  } catch (err) {
+    logEvent(c, "error", "oauth.db_upsert_failed", { error: safeError(err) });
+    return c.text("Failed to persist shop installation (check server logs)", 500);
+  }
+
+  // 3) Post-install tasks should never block redirect (run in background)
+  const requestId = (c.get("requestId") ?? "unknown") as string;
+  const flowId = (c.get("flowId") ?? requestId) as string;
+
+  c.executionCtx.waitUntil(
+    (async () => {
+      // Try to fetch real shop id/name and update DB (best-effort)
+      try {
+        const info = await getShopInfo({
+          shop,
+          accessToken: tokenRes.accessToken,
+          apiVersion: c.env.SHOPIFY_API_VERSION,
+        });
+
+        await upsertShop(c.env.DB, {
+          shop,
+          shopId: info.shopId,
+          shopName: info.name,
+          accessToken: tokenRes.accessToken,
+          scopes: tokenRes.scope,
+          installedAt: nowIso(),
+        });
+      } catch (err) {
+        console.error(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            level: "error",
+            msg: "post_install.getShopInfo_failed",
+            requestId,
+            flowId,
+            error: safeError(err),
+          }),
+        );
+      }
+
+      // Register app/uninstalled webhook (best-effort)
+      try {
+        await registerAppUninstalledWebhook({
+          shop,
+          accessToken: tokenRes.accessToken,
+          apiVersion: c.env.SHOPIFY_API_VERSION,
+          callbackUrl: `${c.env.SHOPIFY_APP_URL}/webhooks/app_uninstalled`,
+        });
+      } catch (err: any) {
+        const msg = String(err?.message || err);
+        if (!msg.includes("Address for this topic has already been taken")) {
+          console.error(
+            JSON.stringify({
+              ts: new Date().toISOString(),
+              level: "error",
+              msg: "post_install.webhook_registration_failed",
+              requestId,
+              flowId,
+              error: safeError(err),
+            }),
+          );
+        }
+      }
+    })(),
+  );
+
+  // 4) NOW it is safe to clear the state cookie
+  deleteCookie(c, OAUTH_STATE_COOKIE, { path: "/" });
+
+  // 5) Redirect back into embedded app
+  return c.redirect(
+    `${c.env.SHOPIFY_APP_URL}/?shop=${encodeURIComponent(shop)}&host=${encodeURIComponent(host)}`,
+    302,
+  );
 });
+
 
 // Shopify webhook: app/uninstalled
 app.post('/webhooks/shopify/app-uninstalled', async (c) => {
@@ -749,39 +853,30 @@ app.post('/webhooks/shopify/app-uninstalled', async (c) => {
   return c.text('OK', 200);
 });
 
-// Session-authenticated API: shop info
-app.get('/api/shop', async (c) => {
+app.get("/api/shop", async (c) => {
   const u = new URL(c.req.url);
-  if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
+  if (!isAppHost(c.env, u)) return c.text("Not Found", 404);
 
   const payload = await requireShopifySession(c);
   if (payload instanceof Response) return payload;
 
   const shop = shopFromSessionTokenPayload(payload);
-  const shopRow = await withStep(c, 'db.getShopByShop', () =>
-    getShopByShop(c.env.DB, shop)
-  );
-  if (!shopRow || shopRow.uninstalled_at) {
-    return c.json({ error: 'App not installed for this shop' }, 401);
-  }
 
-  const info = await withStep(c, 'shopify.getShopInfo', () =>
-    getShopInfo({
-      shop,
-      accessToken: shopRow.access_token,
-      apiVersion: c.env.SHOPIFY_API_VERSION,
-    })
-  );
+  const shopRow = await withStep(c, "db.getShopByShop", () => getShopByShop(c.env.DB, shop));
+  if (!shopRow || shopRow.uninstalled_at) {
+    return c.json({ error: "App not installed for this shop" }, 401);
+  }
 
   const out: ShopInfoApi = {
     shop,
-    shopId: info.shopId,
-    shopName: info.name,
-    primaryDomain: info.primaryDomainHost || null,
+    shopId: shopRow.shop_id,
+    shopName: shopRow.shop_name,
+    primaryDomain: null, // we can re-add later if needed
   };
 
   return c.json(out, 200, { ...noStoreHeaders() });
 });
+
 
 // Session-authenticated API: current Apple Pay status
 app.get('/api/applepay/status', async (c) => {
@@ -820,12 +915,16 @@ app.get('/api/applepay/domains', async (c) => {
   if (payload instanceof Response) return payload;
 
   const shop = shopFromSessionTokenPayload(payload);
-  const shopRow = await getShopByShop(c.env.DB, shop);
+  const shopRow = await withStep(c, 'db.getShopByShop', () =>
+    getShopByShop(c.env.DB, shop)
+  );
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: 'App not installed for this shop' }, 401);
   }
 
-  const rows = await listMerchantDomainsByShop(c.env.DB, shop);
+  const rows = await withStep(c, 'db.listMerchantDomainsByShop', () =>
+    listMerchantDomainsByShop(c.env.DB, shop)
+  );
 
   const domains = rows.map((row) => {
     const dnsInstructions = dnsInstructionsFor(row.domain, c.env.CF_SAAS_CNAME_TARGET);
@@ -1109,30 +1208,15 @@ app.all('*', async (c) => {
   return new Response(res.body, { status: res.status, headers });
 });
 
-// --- OpenTelemetry Configuration ---
-const otelConfig: ResolveConfigFn = (env: Env, _trigger) => {
-  return {
-    exporter: {
-      url: env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://localhost:4318',
-      headers: {
-        // Safe extraction of the secret header
-        'DD-API-KEY': env.OTEL_EXPORTER_OTLP_HEADERS?.split('=')[1] || '',
-      },
-    },
-    service: { name: env.OTEL_SERVICE_NAME || 'applepay-control-plane' },
-  };
-};
-
 // --- Your Existing Logic (Wrapped in a variable) ---
 const handler = {
-  // 1. Pass web requests to your existing Hono app
-  fetch: app.fetch,
+  // ✅ Always forward env + ctx into Hono (prevents c.env.DB being undefined)
+  fetch: (request: Request, env: Env, ctx: ExecutionContext) => {
+    return app.fetch(request, env, ctx);
+  },
 
-  // 2. Add the missing Scheduled handler for Cron triggers
   scheduled: (_controller: ScheduledController, _env: Env, _ctx: ExecutionContext) => {
-    // no-op: prevents cron trigger exceptions
     console.log("Cron trigger fired");
-    // Add any scheduled logic here if needed
   },
 };
 
@@ -1163,10 +1247,10 @@ app.onError((err, c) => {
     );
   }
 
-  return c.json({ error: 'Internal error', requestId, flowId }, 500);
+  return c.json({ error: 'Internal error', msg: String(err), requestId, flowId }, 500);
 });
 
 
-// --- The Final Export (Wraps your handler) ---
-export default instrument(handler, otelConfig);
+// --- The Final Export ---
+export default handler;
 

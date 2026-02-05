@@ -1,5 +1,3 @@
-import { trace, SpanStatusCode } from '@opentelemetry/api';
-
 export function nowIso(): string {
   return new Date().toISOString();
 }
@@ -22,30 +20,16 @@ export async function sha256Hex(input: string): Promise<string> {
 }
 
 /**
- * Wraps a promise in an OpenTelemetry span for error tracking.
- * Useful for tracing internal operations like Apple API calls or database transactions.
+ * Wraps a promise for error tracking. (OpenTelemetry removed)
  */
 export async function performOp<T>(
   name: string,
   operation: () => Promise<T>
 ): Promise<T> {
-  const tracer = trace.getTracer('applepay-worker');
-  return tracer.startActiveSpan(name, async (span) => {
-    try {
-      const result = await operation();
-      span.setStatus({ code: SpanStatusCode.OK });
-      return result;
-    } catch (err: any) {
-      // Capture the error in Datadog
-      span.recordException(err);
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: err.message || String(err),
-      });
-      // Re-throw so the app handles it normally
-      throw err;
-    } finally {
-      span.end();
-    }
-  });
+  try {
+    return await operation();
+  } catch (err: any) {
+    console.error(`[performOp:${name}]`, err);
+    throw err;
+  }
 }

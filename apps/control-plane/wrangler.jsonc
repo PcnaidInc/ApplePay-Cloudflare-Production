@@ -2,21 +2,15 @@
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "applepay-control-plane",
   "main": "src/index.ts",
-  "compatibility_date": "2026-01-13",
-  "compatibility_flags": ["nodejs_compat"], // <--- ADD THIS LINE
-  "workers_dev": true, // <-- ADD THIS LINE
+  "compatibility_date": "2024-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": false
+  },
   "assets": {
     "directory": "../admin-ui/dist",
     "binding": "ASSETS"
-  },
-  "observability": {
-    "enabled": true,
-    "head_sampling_rate": 1,
-    "logs": {
-      "enabled": true,
-      "head_sampling_rate": 1,
-      "invocation_logs": true
-    },
   },
   "kv_namespaces": [
     { "binding": "APPLEPAY_KV",
@@ -46,22 +40,25 @@
     "APPLE_VERIFICATION_KV_KEY": "applepay:partner-verification-file",
     "APPLE_ENCRYPT_TO": "platformintegrator.com.pcnaid.shopifyverifier",
     "SHOPIFY_APP_URL": "https://pcnaid-edge.com",
-	  "OTEL_SERVICE_NAME": "applepay-control-plane",
+    "SHOPIFY_API_KEY": "0a03a301c38af1ddffdd773a18e025f4",
     "DEFAULT_DOMAIN": "pcnaid-edge.com",
-    "DEFAULT_MERCHANT_ID": "default",
-    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.datadoghq.com/v1/traces"
+    "DEFAULT_MERCHANT_ID": "default"
   },
   "triggers": {
     "crons": ["0 * * * *"]
   },
   "routes": [
   // 1. RUN the worker ONLY for the Apple Pay file
+  // 2. Do NOT run the worker for anything else. 
+  // By NOT adding a route for "*.pcnaid.com/*", standard traffic bypasses the worker 
+  // and flows directly to Shopify via your CNAME record.
   {
     "pattern": "*/.well-known/apple-developer-merchantid-domain-association",
     "zone_name": "pcnaid-edge.com" // Optional, if you can bind to the zone
   },
-  // 2. Do NOT run the worker for anything else. 
-  // By NOT adding a route for "*.pcnaid.com/*", standard traffic bypasses the worker 
-  // and flows directly to Shopify via your CNAME record.
+  {
+    "pattern": "pcnaid-edge.com", 
+    "custom_domain": true
+  }
 ]
 }
