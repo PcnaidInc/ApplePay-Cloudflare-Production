@@ -29,10 +29,13 @@ This app uses **Shopify App Bridge v4** with standardized session token authenti
 - `POST /api/applepay/check` - Check merchant details (debug)
 
 ### Testing Authentication
-1. **Valid Session**: Navigate to app in Shopify Admin → should load without errors
-2. **API Calls**: All protected endpoints should return 200 with valid data
-3. **Invalid Token**: Send request without token → should return 401 with retry header
-4. **Token Refresh**: App Bridge v4 automatically refreshes expired tokens
+1. **Valid Session**: Navigate to the app in Shopify Admin. The UI should load without errors.
+2. **API Calls**: All protected endpoints should return `200 OK` with valid data.
+3. **Invalid/Missing Token**: Use `curl` to make a request to a protected endpoint without a valid session token. The server should respond with `401 Unauthorized` and the `X-Shopify-Retry-Invalid-Session-Request: 1` header.
+
+   ```bash
+   # Example: Missing token
+   curl -i https://pcnaid-edge.com/api/shop
 
 
 - **apps/control-plane**: A single Cloudflare Worker that:
