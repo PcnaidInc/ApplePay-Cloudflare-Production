@@ -14,7 +14,7 @@ import {
   verifyShopifyHmac,
   verifyShopifyWebhookHmac,
 } from './lib/shopifyHmac';
-import { verifyShopifySessionToken } from './lib/shopifySessionToken';
+import { requireShopifySession, getShopifySession } from './middleware/requireShopifySession';
 import {
   createPaymentSession,
   getMerchantDetails,
@@ -168,18 +168,6 @@ type Env = {
   APPLE_VERIFICATION_KV_KEY?: string;
 };
 
-type ShopifySessionPayload = {
-  iss: string;
-  dest: string; // https://{shop}.myshopify.com
-  aud: string;
-  sub: string;
-  exp: number;
-  nbf: number;
-  iat: number;
-  jti: string;
-  sid?: string;
-};
-
 function normalizeShopParam(raw: string): string {
   return raw
     .trim()
@@ -227,6 +215,7 @@ type ObsVars = {
   requestId: string;
   flowId: string;
   step: number;
+  shopifySession?: { payload: any; shop: string };
 };
 
 const app = new Hono<{ Bindings: Env; Variables: ObsVars }>();
@@ -324,53 +313,6 @@ async function getPartnerVerificationFile(env: Env): Promise<string> {
     throw new Error(`Missing partner verification file in KV at key: ${key}`);
   }
   return file;
-}
-
-async function requireShopifySession(c: any): Promise<ShopifySessionPayload | Response> {
-  const auth = c.req.header('Authorization') || '';
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  if (!m) {
-    return c.json({ error: 'Missing Authorization: Bearer <token>' }, 401);
-  }
-  const token = m[1];
-
-  let payload: ShopifySessionPayload;
-  try {
-    payload = (await verifyShopifySessionToken(
-      token,
-      c.env.SHOPIFY_API_KEY,
-      c.env.SHOPIFY_API_SECRET
-    )) as ShopifySessionPayload;
-  } catch {
-    return c.json({ error: 'Invalid Shopify session token' }, 401);
-  }
-  return payload;
-}
-
-function shopFromSessionTokenPayload(payload: ShopifySessionPayload): string {
-  const candidates = [payload.dest, payload.iss].filter(Boolean) as string[];
-
-  for (const candidate of candidates) {
-    try {
-      const u = new URL(candidate);
-      const host = normalizeHostname(u.hostname);
-
-      // Classic embedded admin: https://{shop}.myshopify.com/admin
-      if (host.endsWith(".myshopify.com")) return host;
-
-      // New admin: https://admin.shopify.com/store/<store>
-      if (host === "admin.shopify.com") {
-        const parts = u.pathname.split("/").filter(Boolean);
-        const storeIdx = parts.indexOf("store");
-        const slug = storeIdx >= 0 ? parts[storeIdx + 1] : undefined;
-        if (slug) return `${normalizeHostname(slug)}.myshopify.com`;
-      }
-    } catch {
-      // try next candidate
-    }
-  }
-
-  throw new Error("Unable to determine shop domain from Shopify session token payload");
 }
 
 function toApplePayStatus(row: MerchantDomainRow | null, dnsInstructions: DnsInstructionsApi | null = null): ApplePayStatusApi {
@@ -862,14 +804,12 @@ app.post('/webhooks/shopify/app-uninstalled', async (c) => {
   return c.text('OK', 200);
 });
 
-app.get("/api/shop", async (c) => {
+// Session-authenticated API: get shop info
+app.get("/api/shop", requireShopifySession, async (c) => {
   const u = new URL(c.req.url);
   if (!isAppHost(c.env, u)) return c.text("Not Found", 404);
 
-  const payload = await requireShopifySession(c);
-  if (payload instanceof Response) return payload;
-
-  const shop = shopFromSessionTokenPayload(payload);
+  const { shop } = getShopifySession(c);
 
   const shopRow = await withStep(c, "db.getShopByShop", () => getShopByShop(c.env.DB, shop));
   if (!shopRow || shopRow.uninstalled_at) {
@@ -888,14 +828,11 @@ app.get("/api/shop", async (c) => {
 
 
 // Session-authenticated API: current Apple Pay status
-app.get('/api/applepay/status', async (c) => {
+app.get('/api/applepay/status', requireShopifySession, async (c) => {
   const u = new URL(c.req.url);
   if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
-  const payload = await requireShopifySession(c);
-  if (payload instanceof Response) return payload;
-
-  const shop = shopFromSessionTokenPayload(payload);
+  const { shop } = getShopifySession(c);
   const shopRow = await withStep(c, 'db.getShopByShop', () =>
     getShopByShop(c.env.DB, shop)
   );
@@ -916,14 +853,11 @@ app.get('/api/applepay/status', async (c) => {
 });
 
 // Session-authenticated API: list all domains for this shop
-app.get('/api/applepay/domains', async (c) => {
+app.get('/api/applepay/domains', requireShopifySession, async (c) => {
   const u = new URL(c.req.url);
   if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
-  const payload = await requireShopifySession(c);
-  if (payload instanceof Response) return payload;
-
-  const shop = shopFromSessionTokenPayload(payload);
+  const { shop } = getShopifySession(c);
   const shopRow = await withStep(c, 'db.getShopByShop', () =>
     getShopByShop(c.env.DB, shop)
   );
@@ -954,14 +888,11 @@ app.get('/api/applepay/domains', async (c) => {
 
 
 // Session-authenticated API: onboard (domain verification + registerMerchant)
-app.post('/api/applepay/onboard', async (c) => {
+app.post('/api/applepay/onboard', requireShopifySession, async (c) => {
   const u = new URL(c.req.url);
   if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
-  const payload = await requireShopifySession(c);
-  if (payload instanceof Response) return payload;
-
-  const shop = shopFromSessionTokenPayload(payload);
+  const { shop } = getShopifySession(c);
   const shopRow = await getShopByShop(c.env.DB, shop);
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: 'App not installed for this shop' }, 401);
@@ -1101,14 +1032,11 @@ function coerceHostname(input: string): string {
 
 
 // Session-authenticated API: check merchant details (debug)
-app.post('/api/applepay/check', async (c) => {
+app.post('/api/applepay/check', requireShopifySession, async (c) => {
   const u = new URL(c.req.url);
   if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
-  const payload = await requireShopifySession(c);
-  if (payload instanceof Response) return payload;
-
-  const shop = shopFromSessionTokenPayload(payload);
+  const { shop } = getShopifySession(c);
   const shopRow = await withStep(c, 'db.getShopByShop', () =>
     getShopByShop(c.env.DB, shop)
   );

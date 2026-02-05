@@ -1,7 +1,6 @@
 // FILE: apps/admin-ui/src/App.tsx
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AppBridgeProvider } from './context/appBridge';
-import { useAuthenticatedFetch } from './hooks/useAuthenticatedFetch';
+import { apiJson, type ApiErrorBody } from './api/client';
 import {
   Badge,
   Banner,
@@ -61,19 +60,6 @@ type DomainsResponse = {
   ok: true;
   domains: ApplePayDomain[];
 };
-
-type ApiErrorBody = { error: string; details?: unknown };
-
-class ApiError extends Error {
-  status: number;
-  details?: unknown;
-  constructor(message: string, status: number, details?: unknown) {
-    super(message);
-    this.name = 'ApiError';
-    this.status = status;
-    this.details = details;
-  }
-}
 
 function getQueryParam(name: string): string | null {
   const url = new URL(window.location.href);
@@ -149,8 +135,6 @@ const POLL_IDLE_MS = 12 * 60 * 60 * 1000; // 12h when “idle”
 const POLL_MAX_BACKOFF_MS = 60_000; // cap backoff at 60s
 
 function AppContent({ config }: { config: Config }) {
-  const authenticatedFetch = useAuthenticatedFetch();
-
   const [shopInfo, setShopInfo] = useState<ShopInfo | null>(null);
   const [domains, setDomains] = useState<ApplePayDomain[]>([]);
   const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
@@ -176,29 +160,10 @@ function AppContent({ config }: { config: Config }) {
   const failureCount = useRef(0);
   const pollTimeoutId = useRef<number | null>(null);
 
-    const apiFetch = useCallback(
-    (path: string, opts: RequestInit = {}): Promise<Response> => authenticatedFetch(path, opts),
-    [authenticatedFetch],
-  );
-
-  const apiJson = useCallback(
-    async function apiJson<T>(path: string, opts: RequestInit = {}): Promise<T> {
-      const res = await apiFetch(path, opts);
-      const text = await res.text();
-      const json = text ? JSON.parse(text) : null;
-      if (!res.ok) {
-        const body = json as ApiErrorBody | null;
-        throw new ApiError(body?.error || `Request failed (${res.status})`, res.status, body?.details);
-      }
-      return json as T;
-    },
-    [apiFetch],
-  );
-
   const refreshShopInfo = useCallback(async () => {
     const info = await apiJson<ShopInfo>('/api/shop');
     setShopInfo(info);
-  }, [apiJson]);
+  }, []);
 
   // IMPORTANT: this now RETURNS the latest list so polling can make decisions immediately
   const refreshDomains = useCallback(async (): Promise<ApplePayDomain[]> => {
@@ -214,7 +179,7 @@ function AppContent({ config }: { config: Config }) {
     });
 
     return next;
-  }, [apiJson]);
+  }, []);
 
   const onboardDomain = useCallback(
     async (domain: string, { silent = false }: { silent?: boolean } = {}) => {
@@ -251,7 +216,7 @@ function AppContent({ config }: { config: Config }) {
         if (!silent) setBusy(false);
       }
     },
-    [apiJson],
+    [],
   );
 
    // When app bridge becomes ready, load shop + domains
@@ -794,15 +759,6 @@ export default function App() {
     loadConfig();
   }, []);
 
-  const appBridgeConfig = useMemo(() => {
-    if (!config || !host) return null;
-    return {
-      apiKey: config.shopifyApiKey,
-      host,
-      forceRedirect: true,
-    };
-  }, [config, host]);
-
   if (!shop || !host) {
     return (
       <Page title="Apple Pay Domains">
@@ -835,23 +791,8 @@ export default function App() {
     );
   }
 
-
-  if (!appBridgeConfig) {
-    return (
-      <Page title="Apple Pay Domains">
-        <Card>
-          <Box padding="400">
-            <Text as="p">Loading...</Text>
-          </Box>
-        </Card>
-      </Page>
-    );
-  }
-
-  return (
-    <AppBridgeProvider config={appBridgeConfig}>
-      <AppContent config={config} />
-    </AppBridgeProvider>
-  );
+  // App Bridge v4 initializes automatically from the script tag and meta tags in index.html
+  // No need for AppBridgeProvider or manual initialization
+  return <AppContent config={config} />;
 }
 

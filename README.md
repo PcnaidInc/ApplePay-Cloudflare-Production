@@ -4,6 +4,40 @@ This repo replaces the legacy Azure Function “control plane” with a Cloudfla
 
 ## What this repo contains
 
+## Authentication & Security
+
+This app uses **Shopify App Bridge v4** with standardized session token authentication:
+
+### Frontend (Admin UI)
+- **App Bridge v4**: Loaded via CDN script tag in `index.html`
+- **Automatic Token Injection**: App Bridge v4 automatically injects session tokens into `fetch()` requests
+- **No Manual Init**: No Provider, no `createApp()`, just plain `fetch()` calls
+- **API Client**: Unified client at `apps/admin-ui/src/api/client.ts` for consistent error handling
+
+### Backend (Control Plane)
+- **Session Token Middleware**: All `/api/*` routes are protected by `requireShopifySession` middleware
+- **JWT Verification**: Validates session tokens using HS256 with `SHOPIFY_API_SECRET`
+- **Shop Extraction**: Automatically extracts shop domain from token payload
+- **401 + Retry Header**: Returns `X-Shopify-Retry-Invalid-Session-Request: 1` on invalid tokens to trigger App Bridge token refresh
+- **Public Routes**: `/api/config`, `/.well-known/*`, `/auth/*`, and `/webhooks/*` are exempt from session auth
+
+### Protected Endpoints
+- `GET /api/shop` - Get shop information
+- `GET /api/applepay/status` - Get Apple Pay domain status
+- `GET /api/applepay/domains` - List all domains for shop
+- `POST /api/applepay/onboard` - Onboard a new domain
+- `POST /api/applepay/check` - Check merchant details (debug)
+
+### Testing Authentication
+1. **Valid Session**: Navigate to the app in Shopify Admin. The UI should load without errors.
+2. **API Calls**: All protected endpoints should return `200 OK` with valid data.
+3. **Invalid/Missing Token**: Use `curl` to make a request to a protected endpoint without a valid session token. The server should respond with `401 Unauthorized` and the `X-Shopify-Retry-Invalid-Session-Request: 1` header.
+
+   ```bash
+   # Example: Missing token
+   curl -i https://pcnaid-edge.com/api/shop
+
+
 - **apps/control-plane**: A single Cloudflare Worker that:
   - Serves Apple’s domain verification file at `/.well-known/apple-developer-merchantid-domain-association`
   - Exposes the Shopify embedded app backend (OAuth, API endpoints)
