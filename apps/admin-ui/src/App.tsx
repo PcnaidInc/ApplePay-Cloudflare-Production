@@ -1,6 +1,6 @@
 // FILE: apps/admin-ui/src/App.tsx
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { apiJson, ApiError } from './api/client';
+import { apiJson } from './api/client';
 import {
   Badge,
   Banner,
