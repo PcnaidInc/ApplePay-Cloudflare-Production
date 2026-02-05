@@ -66,8 +66,8 @@ export function useAuthenticatedFetch() {
           const cloned = res.clone();
           const ct = cloned.headers.get('content-type') || '';
           if (ct.includes('application/json')) {
-            const body = (await cloned.json().catch(() => null)) as any;
-            if (typeof body?.error === 'string') errorMessage = body.error;
+            const body = (await cloned.json().catch(() => null)) as { error?: unknown } | null;
+            if (body && typeof body.error === 'string') errorMessage = body.error;
           } else {
             errorMessage = await cloned.text().catch(() => '');
           }
