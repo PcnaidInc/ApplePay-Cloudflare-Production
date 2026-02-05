@@ -69,7 +69,21 @@ export async function apiJson<T>(path: string, options: RequestInit = {}): Promi
   const response = await apiFetch(path, options);
   
   const text = await response.text();
-  const json = text ? JSON.parse(text) : null;
+  let json: unknown = null;
+  if (text) {
+    try {
+      json = JSON.parse(text);
+    } catch (error) {
+      throw new ApiError(
+        'Invalid JSON response from server',
+        response.status,
+        {
+          cause: error instanceof Error ? error.message : String(error),
+          raw: text,
+        }
+      );
+    }
+  }
   
   if (!response.ok) {
     const body = json as ApiErrorBody | null;
