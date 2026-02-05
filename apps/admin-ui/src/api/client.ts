@@ -5,7 +5,7 @@
  * so we just need to handle errors and retries consistently.
  */
 
-type ApiErrorBody = {
+export type ApiErrorBody = {
   error: string;
   details?: unknown;
 };

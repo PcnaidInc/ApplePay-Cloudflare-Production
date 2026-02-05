@@ -1,6 +1,6 @@
 // FILE: apps/admin-ui/src/App.tsx
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { apiJson } from './api/client';
+import { apiJson, type ApiErrorBody } from './api/client';
 import {
   Badge,
   Banner,
@@ -60,8 +60,6 @@ type DomainsResponse = {
   ok: true;
   domains: ApplePayDomain[];
 };
-
-type ApiErrorBody = { error: string; details?: unknown };
 
 function getQueryParam(name: string): string | null {
   const url = new URL(window.location.href);

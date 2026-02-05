@@ -40,9 +40,11 @@ export async function requireShopifySession(
 ) {
   const authHeader = c.req.header('Authorization');
   const token = extractBearerToken(authHeader);
+  
+  // Compute isXhr once at the beginning to avoid duplicate work
+  const isXhr = isXhrRequest(c.req.raw.headers);
 
   if (!token) {
-    const isXhr = isXhrRequest(c.req.raw.headers);
     if (isXhr) {
       c.header('X-Shopify-Retry-Invalid-Session-Request', '1');
     }
@@ -54,7 +56,6 @@ export async function requireShopifySession(
     payload = await verifySessionToken(token, c.env.SHOPIFY_API_KEY, c.env.SHOPIFY_API_SECRET);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : 'Invalid session token';
-    const isXhr = isXhrRequest(c.req.raw.headers);
 
     // Log token verification failures for observability without exposing the token
     console.error('Shopify session token verification failed', {
