@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX IF NOT EXISTS idx_merchant_domains_domain ON merchant_domains(domain);

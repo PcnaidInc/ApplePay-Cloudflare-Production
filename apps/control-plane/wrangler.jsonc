@@ -45,7 +45,7 @@
     "CF_SAAS_CNAME_TARGET": "fallback.pcnaid-edge.com",
     "APPLE_VERIFICATION_KV_KEY": "applepay:partner-verification-file",
     "APPLE_ENCRYPT_TO": "platformintegrator.com.pcnaid.shopifyverifier",
-    "SHOPIFY_APP_URL": "https://applepay-control-plane.pcnaid.workers.dev",
+    "SHOPIFY_APP_URL": "https://pcnaid-edge.com",
 	  "OTEL_SERVICE_NAME": "applepay-control-plane",
     "DEFAULT_DOMAIN": "pcnaid-edge.com",
     "DEFAULT_MERCHANT_ID": "default",

@@ -2,7 +2,7 @@
 
 client_id = "0a03a301c38af1ddffdd773a18e025f4"
 name = "Verify ApplePay"
-application_url = "https://applepay-control-plane.pcnaid.workers.dev"
+application_url = "https://pcnaid-edge.com"
 embedded = true
 handle = "verify-applepay"
 
@@ -11,7 +11,7 @@ automatically_update_urls_on_dev =true
 dev_store_url = "https://app-dev-store-v1.myshopify.com"
 
 [app_preferences]
-url = "https://applepay-control-plane.pcnaid.workers.dev/preferences"
+url = "https://pcnaid-edge.com/preferences"
 
 [access.admin]
 direct_api_mode = "online"
@@ -23,7 +23,7 @@ api_version = "2025-07"
 [[webhooks.subscriptions]]
 topics = [ "app/uninstalled" ]
 compliance_topics = [ "customers/redact", "customers/data_request", "shop/redact" ]
-uri = "https://applepay-control-plane.pcnaid.workers.dev/webhooks"
+uri = "https://pcnaid-edge.com/webhooks"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
@@ -33,18 +33,18 @@ use_legacy_install_flow = false
 
 [auth]
 redirect_urls = [
-  "https://applepay-control-plane.pcnaid.workers.dev/auth/callback",
-  "https://applepay-control-plane.pcnaid.workers.dev/auth/oauth/callback",
+  "https://pcnaid-edge.com/auth/callback",
+  "https://pcnaid-edge.com/auth/oauth/callback",
 ]
 [customer_authentication]
 redirect_uris = [
-  "https://applepay-control-plane.pcnaid.workers.dev/api/customer/auth/callback"
+  "https://pcnaid-edge.com/api/customer/auth/callback"
 ]
 javascript_origins = [
-  "https://applepay-control-plane.pcnaid.workers.dev"
+  "https://pcnaid-edge.com"
 ]
 logout_urls = [
-  "https://applepay-control-plane.pcnaid.workers.dev/api/customer/logout"
+  "https://pcnaid-edge.com/api/customer/logout"
 ]
 
 
