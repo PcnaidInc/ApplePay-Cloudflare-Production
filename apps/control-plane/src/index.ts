@@ -224,6 +224,37 @@ const WELL_KNOWN_PATH = '/.well-known/apple-developer-merchantid-domain-associat
 const DEFAULT_VERIFICATION_KV_KEY = 'applepay:partner-verification-file';
 const OAUTH_STATE_COOKIE = '__applepay_oauth_state';
 
+// Error handler must be registered BEFORE routes
+app.onError((err, c) => {
+  logEvent(c, 'error', 'unhandled.exception', { error: safeError(err) });
+
+  const requestId = (c.get('requestId') ?? 'unknown') as string;
+  const flowId = (c.get('flowId') ?? requestId) as string;
+
+  const accept = c.req.header('accept') ?? '';
+  const xRequestedWith = c.req.header('x-requested-with') ?? '';
+
+  // Prefer JSON for XHR / API calls (even if the browser also accepts text/html).
+  const wantsJson =
+    accept.includes('application/json') ||
+    accept.includes('application/*+json') ||
+    xRequestedWith.toLowerCase() === 'xmlhttprequest';
+
+  if (!wantsJson && accept.includes('text/html')) {
+    return c.html(
+      `<!doctype html>
+      <html><body style="font-family: system-ui; padding: 24px;">
+        <h2>Something went wrong</h2>
+        <p>Request ID: <code>${requestId}</code></p>
+        <p>Flow ID: <code>${flowId}</code></p>
+      </body></html>`,
+      500,
+    );
+  }
+
+  return c.json({ error: 'Internal error', msg: String(err), requestId, flowId }, 500);
+});
+
 // Global middleware for request tracking and correlation
 app.use('*', async (c, next) => {
 
@@ -263,17 +294,23 @@ app.use('*', async (c, next) => {
     }
     await next();
   } finally {
-    // Correlation headers back to the client
-    c.header('x-request-id', requestId);
-    c.header('x-flow-id', flowId);
+    try {
+      // Correlation headers back to the client
+      c.header('x-request-id', requestId);
+      c.header('x-flow-id', flowId);
 
-    // Compact latency hint (shows up in browser devtools timing tab)
-    c.header('server-timing', `worker;dur=${Date.now() - started}`);
+      // Compact latency hint (shows up in browser devtools timing tab)
+      const duration = Date.now() - started;
+      c.header('server-timing', `worker;dur=${duration}`);
 
-    logEvent(c, 'info', 'request.complete', {
-      status: c.res?.status ?? null,
-      durationMs: Date.now() - started,
-    });
+      logEvent(c, 'info', 'request.complete', {
+        status: c.res?.status ?? null,
+        durationMs: duration,
+      });
+    } catch (finallyErr) {
+      // Log but don't throw - finally block errors can mask the original error
+      console.error('Error in finally block:', safeError(finallyErr));
+    }
   }
 });
 
@@ -1156,37 +1193,6 @@ const handler = {
     console.log("Cron trigger fired");
   },
 };
-
-app.onError((err, c) => {
-  logEvent(c, 'error', 'unhandled.exception', { error: safeError(err) });
-
-  const requestId = (c.get('requestId') ?? 'unknown') as string;
-  const flowId = (c.get('flowId') ?? requestId) as string;
-
-  const accept = c.req.header('accept') ?? '';
-  const xRequestedWith = c.req.header('x-requested-with') ?? '';
-
-  // Prefer JSON for XHR / API calls (even if the browser also accepts text/html).
-  const wantsJson =
-    accept.includes('application/json') ||
-    accept.includes('application/*+json') ||
-    xRequestedWith.toLowerCase() === 'xmlhttprequest';
-
-  if (!wantsJson && accept.includes('text/html')) {
-    return c.html(
-      `<!doctype html>
-      <html><body style="font-family: system-ui; padding: 24px;">
-        <h2>Something went wrong</h2>
-        <p>Request ID: <code>${requestId}</code></p>
-        <p>Flow ID: <code>${flowId}</code></p>
-      </body></html>`,
-      500,
-    );
-  }
-
-  return c.json({ error: 'Internal error', msg: String(err), requestId, flowId }, 500);
-});
-
 
 // --- The Final Export ---
 export default handler;
