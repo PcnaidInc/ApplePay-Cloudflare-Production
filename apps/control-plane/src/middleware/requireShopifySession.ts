@@ -55,11 +55,18 @@ export async function requireShopifySession(
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : 'Invalid session token';
     const isXhr = isXhrRequest(c.req.raw.headers);
-    
+
+    // Log token verification failures for observability without exposing the token
+    console.error('Shopify session token verification failed', {
+      errorMessage,
+      isXhr,
+      method: c.req.method,
+      path: c.req.path,
+    });
+
     if (isXhr) {
       c.header('X-Shopify-Retry-Invalid-Session-Request', '1');
     }
-    
     return c.json({ error: `Invalid Shopify session token: ${errorMessage}` }, 401);
   }
 
