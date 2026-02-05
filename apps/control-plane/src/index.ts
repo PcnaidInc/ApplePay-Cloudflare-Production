@@ -250,7 +250,16 @@ app.use('*', async (c, next) => {
     const skipSchemaRoutes = ['/api/config', '/.well-known/'];
     const needsSchema = !skipSchemaRoutes.some(r => url.pathname.startsWith(r));
     if (needsSchema) {
+    const { pathname } = new URL(c.req.url);
+    const skipDb =
+      pathname === '/api/config' ||
+      pathname === '/api/debug/runtime' ||
+      pathname === WELL_KNOWN_PATH ||
+      pathname.startsWith('/assets/') ||
+      pathname === '/favicon.ico';
+    if (!skipDb) {
       await ensureSchemaOnce(c.env.DB);
+    }
     }
     await next();
   } finally {

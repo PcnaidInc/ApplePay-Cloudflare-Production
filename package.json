@@ -16,6 +16,7 @@
   "scripts": {
     "dev": "concurrently -n UI,WORKER -c auto \"npm -w apps/admin-ui run dev\" \"npm -w apps/control-plane run dev\"",
     "build": "npm -w apps/admin-ui run build && npm -w apps/control-plane run build",
-    "deploy": "npm -w apps/admin-ui run build && npm -w apps/control-plane run deploy"
+    "deploy": "npm -w apps/admin-ui run build && npm -w apps/control-plane run deploy",
+    "postinstall": "node ./scripts/ensure-rollup-native.mjs"
   }
 }
