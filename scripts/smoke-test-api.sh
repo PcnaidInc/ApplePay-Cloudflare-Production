@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # Smoke test script for critical API endpoints
 # Usage: ./smoke-test-api.sh <base-url>
 # Example: ./smoke-test-api.sh http://localhost:8787
