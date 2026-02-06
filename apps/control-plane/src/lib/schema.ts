@@ -30,7 +30,8 @@ async function addColumnIfMissing(
   if (await hasColumn(db, table, columnName)) return;
 
   try {
-    await db.exec(ddl);
+    // Use prepare().run() instead of exec() to avoid D1 meta.duration aggregation issues
+    await db.prepare(ddl).run();
   } catch (err) {
     // Race safety: another isolate/request may have added the column after our check.
     if (await hasColumn(db, table, columnName)) return;
@@ -44,10 +45,12 @@ async function addColumnIfMissing(
 export function ensureSchema(db: D1Database): Promise<void> {
   if (_ensured) return _ensured;
   _ensured = (async () => {
-    // Create tables with the latest schema (no-ops if they already exist).
-    await db.exec(`
-      PRAGMA foreign_keys = ON;
+    // Enable foreign keys first (separate from table creation to avoid D1 exec() meta.duration bug)
+    await db.prepare(`PRAGMA foreign_keys = ON`).run();
 
+    // Create tables with the latest schema (no-ops if they already exist).
+    // Split into separate exec calls to avoid D1 internal aggregation errors.
+    await db.exec(`
       CREATE TABLE IF NOT EXISTS shops (
         shop TEXT PRIMARY KEY,
         shop_id TEXT NOT NULL,
