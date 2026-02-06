@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # Validation script to check that the fix is correctly applied
 # This doesn't run the server, but validates the code structure
 
