@@ -2,8 +2,18 @@
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "applepay-control-plane",
   "main": "src/index.ts",
-  "compatibility_date": "2024-04-01",
+  "compatibility_date": "2026-02-06",
   "compatibility_flags": ["nodejs_compat"],
+
+  // If your code expects Node-ish globals (process.env, etc.)
+  "node_compat": true,
+
+"compatibility_flags": [
+    "nodejs_compat_populate_process_env",
+    "enable_nodejs_http_server_modules",
+    "assets_navigation_has_no_effect"
+  ],
+
   "workers_dev": true,
   "observability": {
     "enabled": false
@@ -12,6 +22,20 @@
     "directory": "../admin-ui/dist",
     "binding": "ASSETS"
   },
+
+    // SPA fallback:
+    "not_found_handling": "single-page-application",
+
+    // Critical: ensure these routes hit Worker BEFORE SPA fallback serves index.html
+    // Use route patterns; you can exclude with "!/some/path/*"
+    "run_worker_first": [
+      "/api/*",
+      "/auth/*",
+      "/oauth/*",
+      "/webhooks/*"
+    ]
+  },
+
   "kv_namespaces": [
     { "binding": "APPLEPAY_KV",
       "id": "f8309ee4972841deaa3fa2ffdf55dca2"
