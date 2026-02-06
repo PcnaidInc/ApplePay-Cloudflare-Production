@@ -177,4 +177,4 @@ The changes are minimal and surgical, so rollback risk is low.
 ## References
 - [Hono Error Handling Documentation](https://hono.dev/api/hono#error-handling)
 - [Hono Middleware Order](https://hono.dev/api/hono#middleware)
-- GitHub Issue: #[issue-number]
+- GitHub Issue: PcnaidInc/ApplePay-Cloudflare-Production#7
