@@ -5,5 +5,9 @@ declare module './worker-configuration' {
   interface Env {
     // Re-add the secret that wrangler types keeps deleting
     OTEL_EXPORTER_OTLP_HEADERS?: string;
+    
+    // Oracle ORDS credentials (secrets - set via wrangler secret put)
+    ORDS_USERNAME?: string;
+    ORDS_PASSWORD?: string;
   }
 }

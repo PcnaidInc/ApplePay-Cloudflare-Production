@@ -38,28 +38,17 @@ import {
   listMerchantDomainsByShop,
   updateMerchantDomainCloudflareStatus,
   type MerchantDomainRow,
-} from './lib/db';
+} from './lib/oracleDb';
+import { createOrdsClient, OrdsClient, OrdsError } from './lib/ordsClient';
 import {
   performOp,
   nowIso,
   randomState,
   sha256Hex,
 } from './lib/util';
-import { ensureSchema } from "./lib/schema";
 
-let _schemaEnsured: Promise<void> | null = null;
-
-function ensureSchemaOnce(db: D1Database): Promise<void> {
-  if (_schemaEnsured) return _schemaEnsured;
-
-  _schemaEnsured = ensureSchema(db).catch((err) => {
-    // Allow retry if schema init fails
-    _schemaEnsured = null;
-    throw err;
-  });
-
-  return _schemaEnsured;
-}
+// Schema management is now handled manually via Oracle migrations
+// No runtime schema ensure needed
 
 
 // -----------------------------------------------------------------------------
@@ -138,7 +127,6 @@ type Fetcher = {
 
 type Env = {
   // Storage
-  DB: D1Database;
   APPLEPAY_KV: KVNamespace;
 
   // Static assets (built admin-ui)
@@ -146,6 +134,13 @@ type Env = {
 
   // Outbound mTLS to Apple (configured in wrangler via mtls_certificates)
   APPLE_MTLS: Fetcher;
+
+  // Oracle Database via ORDS (REST-Enabled SQL)
+  ORDS_BASE_URL: string;
+  ORDS_SCHEMA_ALIAS: string;
+  ORDS_USERNAME: string;
+  ORDS_PASSWORD: string;
+  ORDS_AUTH_MODE?: 'basic' | 'oauth';
 
   // Shopify
   SHOPIFY_API_KEY: string;
@@ -216,6 +211,7 @@ type ObsVars = {
   flowId: string;
   step: number;
   shopifySession?: { payload: any; shop: string };
+  oracleClient?: OrdsClient;
 };
 
 const app = new Hono<{ Bindings: Env; Variables: ObsVars }>();
@@ -223,6 +219,23 @@ const app = new Hono<{ Bindings: Env; Variables: ObsVars }>();
 const WELL_KNOWN_PATH = '/.well-known/apple-developer-merchantid-domain-association';
 const DEFAULT_VERIFICATION_KV_KEY = 'applepay:partner-verification-file';
 const OAUTH_STATE_COOKIE = '__applepay_oauth_state';
+
+/**
+ * Get or create Oracle ORDS client for this request
+ */
+function getOracleClient(c: any): OrdsClient {
+  let client = c.get('oracleClient');
+  if (!client) {
+    try {
+      client = createOrdsClient(c.env);
+      c.set('oracleClient', client);
+    } catch (err) {
+      logEvent(c, 'error', 'oracle.client.creation.failed', { error: safeError(err) });
+      throw new Error('Failed to initialize Oracle database client. Please check ORDS configuration.');
+    }
+  }
+  return client;
+}
 
 // Error handler must be registered BEFORE routes
 app.onError((err, c) => {
@@ -276,22 +289,7 @@ app.use('*', async (c, next) => {
   const started = Date.now();
 
   try {
-    // Skip schema check for routes that don't need DB access
-    const url = new URL(c.req.url);
-    const skipSchemaRoutes = ['/api/config', '/.well-known/'];
-    const needsSchema = !skipSchemaRoutes.some(r => url.pathname.startsWith(r));
-    if (needsSchema) {
-    const { pathname } = new URL(c.req.url);
-    const skipDb =
-      pathname === '/api/config' ||
-      pathname === '/api/debug/runtime' ||
-      pathname === WELL_KNOWN_PATH ||
-      pathname.startsWith('/assets/') ||
-      pathname === '/favicon.ico';
-    if (!skipDb) {
-      await ensureSchemaOnce(c.env.DB);
-    }
-    }
+    // Oracle client initialization is lazy - created only when needed via getOracleClient()
     await next();
   } finally {
     try {
@@ -411,12 +409,12 @@ async function proxyMerchantTrafficToShopify(c: any, u: URL): Promise<Response> 
 
   // Lookup by exact hostname; also try stripping/adding "www.".
   const row = await withStep(c, 'db.getMerchantDomainByDomain', async () => {
-    const exact = await getMerchantDomainByDomain(c.env.DB, host);
+    const exact = await getMerchantDomainByDomain(getOracleClient(c), host);
     if (exact) return exact;
     if (host.startsWith('www.')) {
-      return await getMerchantDomainByDomain(c.env.DB, host.slice(4));
+      return await getMerchantDomainByDomain(getOracleClient(c), host.slice(4));
     }
-    return await getMerchantDomainByDomain(c.env.DB, `www.${host}`);
+    return await getMerchantDomainByDomain(getOracleClient(c), `www.${host}`);
   });
 
 // If we don't recognize the hostname, DO NOT fall back to fetch(c.req.raw).
@@ -495,10 +493,10 @@ app.post(
 
     // Find merchant by exact hostname; also try stripping "www.".
     const row = await withStep(c, 'db.getMerchantDomainByDomain', async () => {
-      const exact = await getMerchantDomainByDomain(c.env.DB, host);
+      const exact = await getMerchantDomainByDomain(getOracleClient(c), host);
       if (exact) return exact;
       if (host.startsWith('www.')) {
-        return await getMerchantDomainByDomain(c.env.DB, host.slice(4));
+        return await getMerchantDomainByDomain(getOracleClient(c), host.slice(4));
       }
       return null;
     });
@@ -537,7 +535,7 @@ app.get('/api/debug/runtime', async (c) => {
   return c.json(
     {
       appleEnv: c.env.APPLE_ENV,   // "production" or "sandbox"
-      hasDB: !!c.env.DB,           // should be true
+      hasDB: !!getOracleClient(c),           // should be true
       hasKV: !!c.env.APPLEPAY_KV,  // should be true
     },
     200,
@@ -662,7 +660,7 @@ app.get("/auth/callback", async (c) => {
   // 2) Persist shop ASAP so the app is considered installed even if post-install steps fail
   try {
     await withStep(c, "db.upsertShop", () =>
-      upsertShop(c.env.DB, {
+      upsertShop(getOracleClient(c), {
         shop,
         // Use safe placeholders; background task will replace them if getShopInfo works.
         shopId: shop,
@@ -691,7 +689,7 @@ app.get("/auth/callback", async (c) => {
           apiVersion: c.env.SHOPIFY_API_VERSION,
         });
 
-        await upsertShop(c.env.DB, {
+        await upsertShop(getOracleClient(c), {
           shop,
           shopId: info.shopId,
           shopName: info.name,
@@ -764,7 +762,7 @@ app.post('/webhooks/shopify/app-uninstalled', async (c) => {
     const rawBytes = new TextEncoder().encode(raw);
     if (!(await verifyShopifyWebhookHmac({ apiSecret: c.env.SHOPIFY_API_SECRET, rawBody: rawBytes, hmacHeader: hmac }))) {
       status = 'ERROR';
-      await logWebhookEvent(c.env.DB, {
+      await logWebhookEvent(getOracleClient(c), {
         shop: shop || 'unknown',
         topic,
         webhookId,
@@ -777,10 +775,10 @@ app.post('/webhooks/shopify/app-uninstalled', async (c) => {
     }
 
     if (shop) {
-      await markShopUninstalled(c.env.DB, shop, nowIso());
+      await markShopUninstalled(getOracleClient(c), shop, nowIso());
 
       // Best-effort cleanup: unregister merchant + delete custom hostname.
-      const md = await getMerchantDomainByShop(c.env.DB, shop);
+      const md = await getMerchantDomainByShop(getOracleClient(c), shop);
       if (md?.partner_internal_merchant_identifier) {
         try {
           await unregisterMerchant({
@@ -792,7 +790,7 @@ app.post('/webhooks/shopify/app-uninstalled', async (c) => {
             certificatePem: c.env.APPLE_JWT_CERT_PEM,
             privateKeyPem: c.env.APPLE_JWT_PRIVATE_KEY_PEM,
           });
-          await updateMerchantDomainAppleStatus(c.env.DB, {
+          await updateMerchantDomainAppleStatus(getOracleClient(c), {
             domain: md.domain,
             status: 'UNREGISTERED',
             lastError: null,
@@ -816,7 +814,7 @@ app.post('/webhooks/shopify/app-uninstalled', async (c) => {
       }
     }
 
-    await logWebhookEvent(c.env.DB, {
+    await logWebhookEvent(getOracleClient(c), {
       shop: shop || 'unknown',
       topic,
       webhookId,
@@ -827,7 +825,7 @@ app.post('/webhooks/shopify/app-uninstalled', async (c) => {
     });
   } catch (e: any) {
     status = 'ERROR';
-    await logWebhookEvent(c.env.DB, {
+    await logWebhookEvent(getOracleClient(c), {
       shop: shop || 'unknown',
       topic,
       webhookId,
@@ -848,7 +846,7 @@ app.get("/api/shop", requireShopifySession, async (c) => {
 
   const { shop } = getShopifySession(c);
 
-  const shopRow = await withStep(c, "db.getShopByShop", () => getShopByShop(c.env.DB, shop));
+  const shopRow = await withStep(c, "db.getShopByShop", () => getShopByShop(getOracleClient(c), shop));
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: "App not installed for this shop" }, 401);
   }
@@ -871,7 +869,7 @@ app.get('/api/applepay/status', requireShopifySession, async (c) => {
 
   const { shop } = getShopifySession(c);
   const shopRow = await withStep(c, 'db.getShopByShop', () =>
-    getShopByShop(c.env.DB, shop)
+    getShopByShop(getOracleClient(c), shop)
   );
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: 'App not installed for this shop' }, 401);
@@ -880,10 +878,10 @@ app.get('/api/applepay/status', requireShopifySession, async (c) => {
   const requestedDomain = (c.req.query('domain') || '').trim().toLowerCase();
   let md = await withStep(c, 'db.getMerchantDomain', async () => {
     if (requestedDomain) {
-      const byDomain = await getMerchantDomainByDomain(c.env.DB, requestedDomain);
+      const byDomain = await getMerchantDomainByDomain(getOracleClient(c), requestedDomain);
       if (byDomain && byDomain.shop === shop) return byDomain;
     }
-    return await getMerchantDomainByShop(c.env.DB, shop);
+    return await getMerchantDomainByShop(getOracleClient(c), shop);
   });
 
   return c.json(toApplePayStatus(md), 200, { ...noStoreHeaders() });
@@ -896,14 +894,14 @@ app.get('/api/applepay/domains', requireShopifySession, async (c) => {
 
   const { shop } = getShopifySession(c);
   const shopRow = await withStep(c, 'db.getShopByShop', () =>
-    getShopByShop(c.env.DB, shop)
+    getShopByShop(getOracleClient(c), shop)
   );
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: 'App not installed for this shop' }, 401);
   }
 
   const rows = await withStep(c, 'db.listMerchantDomainsByShop', () =>
-    listMerchantDomainsByShop(c.env.DB, shop)
+    listMerchantDomainsByShop(getOracleClient(c), shop)
   );
 
   const domains = rows.map((row) => {
@@ -930,7 +928,7 @@ app.post('/api/applepay/onboard', requireShopifySession, async (c) => {
   if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
   const { shop } = getShopifySession(c);
-  const shopRow = await getShopByShop(c.env.DB, shop);
+  const shopRow = await getShopByShop(getOracleClient(c), shop);
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: 'App not installed for this shop' }, 401);
   }
@@ -977,7 +975,7 @@ app.post('/api/applepay/onboard', requireShopifySession, async (c) => {
       });
     }
   } catch (e: any) {
-    await upsertMerchantDomain(c.env.DB, {
+    await upsertMerchantDomain(getOracleClient(c), {
       shop,
       shopId: shopRow.shop_id,
       domain,
@@ -993,12 +991,12 @@ app.post('/api/applepay/onboard', requireShopifySession, async (c) => {
       appleLastCheckedAt: null,
     });
 
-    const md = await getMerchantDomainByDomain(c.env.DB, domain);
+    const md = await getMerchantDomainByDomain(getOracleClient(c), domain);
     return c.json(toApplePayStatus(md, dnsInstructions), 200, { ...noStoreHeaders() });
   }
 
   // ✅ mark as in-process
-  await upsertMerchantDomain(c.env.DB, {
+  await upsertMerchantDomain(getOracleClient(c), {
     shop,
     shopId: shopRow.shop_id,
     domain,
@@ -1029,7 +1027,7 @@ app.post('/api/applepay/onboard', requireShopifySession, async (c) => {
       encryptTo: c.env.APPLE_ENCRYPT_TO,
     });
 
-    await updateMerchantDomainAppleStatus(c.env.DB, {
+    await updateMerchantDomainAppleStatus(getOracleClient(c), {
       domain,
       status: 'VERIFIED',
       lastError: null,
@@ -1042,7 +1040,7 @@ app.post('/api/applepay/onboard', requireShopifySession, async (c) => {
     const dnsish =
       /merchantid-domain-association|verification|dns|http\s*404|http\s*522/i.test(message);
 
-    await updateMerchantDomainAppleStatus(c.env.DB, {
+    await updateMerchantDomainAppleStatus(getOracleClient(c), {
       domain,
       status: dnsish ? 'DNS_NOT_CONFIGURED' : 'ERROR',
       lastError: message,
@@ -1050,7 +1048,7 @@ app.post('/api/applepay/onboard', requireShopifySession, async (c) => {
     });
   }
 
-  const md = await getMerchantDomainByDomain(c.env.DB, domain);
+  const md = await getMerchantDomainByDomain(getOracleClient(c), domain);
   return c.json(toApplePayStatus(md, dnsInstructions), 200, { ...noStoreHeaders() });
 });
 
@@ -1075,14 +1073,14 @@ app.post('/api/applepay/check', requireShopifySession, async (c) => {
 
   const { shop } = getShopifySession(c);
   const shopRow = await withStep(c, 'db.getShopByShop', () =>
-    getShopByShop(c.env.DB, shop)
+    getShopByShop(getOracleClient(c), shop)
   );
   if (!shopRow || shopRow.uninstalled_at) {
     return c.json({ error: 'App not installed for this shop' }, 401);
   }
 
   const md = await withStep(c, 'db.getMerchantDomainByShop', () =>
-    getMerchantDomainByShop(c.env.DB, shop)
+    getMerchantDomainByShop(getOracleClient(c), shop)
   );
   if (!md) return c.json(toApplePayStatus(null), 200, { ...noStoreHeaders() });
 
@@ -1100,7 +1098,7 @@ app.post('/api/applepay/check', requireShopifySession, async (c) => {
     );
     // We don’t have a formal status field; treat successful fetch as healthy.
     await withStep(c, 'db.updateMerchantDomainAppleStatus', () =>
-      updateMerchantDomainAppleStatus(c.env.DB, {
+      updateMerchantDomainAppleStatus(getOracleClient(c), {
         domain: md.domain,
         status: md.status,
         lastError: null,
@@ -1109,7 +1107,7 @@ app.post('/api/applepay/check', requireShopifySession, async (c) => {
     );
     return c.json(
       {
-        ...toApplePayStatus(await getMerchantDomainByShop(c.env.DB, shop)),
+        ...toApplePayStatus(await getMerchantDomainByShop(getOracleClient(c), shop)),
         details,
       },
       200,
@@ -1117,14 +1115,14 @@ app.post('/api/applepay/check', requireShopifySession, async (c) => {
     );
   } catch (e: any) {
     await withStep(c, 'db.updateMerchantDomainAppleStatus', () =>
-      updateMerchantDomainAppleStatus(c.env.DB, {
+      updateMerchantDomainAppleStatus(getOracleClient(c), {
         domain: md.domain,
         status: 'ERROR',
         lastError: e?.message || String(e),
         appleLastCheckedAt: nowIso(),
       })
     );
-    return c.json(toApplePayStatus(await getMerchantDomainByShop(c.env.DB, shop)), 200, { ...noStoreHeaders() });
+    return c.json(toApplePayStatus(await getMerchantDomainByShop(getOracleClient(c), shop)), 200, { ...noStoreHeaders() });
   }
 });
 
@@ -1159,7 +1157,7 @@ app.all('*', async (c) => {
       const shop = normalizeShopParam(shopParam);
       if (isValidShopDomain(shop)) {
         const existing = await withStep(c, 'db.getShopByShop', () =>
-          getShopByShop(c.env.DB, shop)
+          getShopByShop(getOracleClient(c), shop)
         );
         if (!existing || existing.uninstalled_at) {
           const authUrl = new URL('/auth', c.env.SHOPIFY_APP_URL);
@@ -1184,7 +1182,7 @@ app.all('*', async (c) => {
 
 // --- Your Existing Logic (Wrapped in a variable) ---
 const handler = {
-  // ✅ Always forward env + ctx into Hono (prevents c.env.DB being undefined)
+  // ✅ Always forward env + ctx into Hono (prevents getOracleClient(c) being undefined)
   fetch: (request: Request, env: Env, ctx: ExecutionContext) => {
     return app.fetch(request, env, ctx);
   },
