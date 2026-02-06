@@ -26,7 +26,7 @@ return {
 ```
 
 When `exec()` is called with a multi-line SQL string:
-1. D1 splits it by newlines
+1. D1 splits it by semicolons
 2. Executes each statement separately
 3. Attempts to aggregate the `duration` from each result's `meta` object
 4. If any result has a missing or malformed `meta` object, accessing `c.meta['duration']` throws an error
