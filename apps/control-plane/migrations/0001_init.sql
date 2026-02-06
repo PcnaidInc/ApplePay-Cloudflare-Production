@@ -1,6 +1,6 @@
 -- D1 schema for Apple Pay Shopify App
-
-PRAGMA foreign_keys = ON;
+-- Note: PRAGMA statements are handled separately to avoid D1 exec() meta.duration aggregation issues
+-- Foreign keys are enabled at runtime in ensureSchema() via db.prepare().run()
 
 CREATE TABLE IF NOT EXISTS shops (
   shop TEXT PRIMARY KEY,
