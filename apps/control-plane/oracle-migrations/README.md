@@ -59,10 +59,13 @@ SELECT * FROM schema_migrations ORDER BY applied_at;
    -- Your DDL/DML here
    
    -- Record migration
-   INSERT INTO schema_migrations (version, description) 
-   VALUES ('00X', 'Brief description');
+   MERGE INTO schema_migrations d
+   USING (SELECT '00X' as version, 'Brief description' as description FROM dual) s
+   ON (d.version = s.version)
+   WHEN NOT MATCHED THEN
+     INSERT (version, description)
+     VALUES (s.version, s.description);
    COMMIT;
-   ```
 
 ## Schema Overview
 
