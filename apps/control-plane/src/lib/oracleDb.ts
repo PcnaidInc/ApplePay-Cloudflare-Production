@@ -2,7 +2,7 @@
 // Replaces D1 data access from db.ts
 
 import { OrdsClient } from './ordsClient';
-import { nowIso, ORACLE_TIMESTAMP_FORMAT } from './timestamp';
+import { nowIso } from './timestamp';
 
 // Keep the same type definitions for compatibility
 export type ShopRow = {
