@@ -39,7 +39,7 @@ import {
   updateMerchantDomainCloudflareStatus,
   type MerchantDomainRow,
 } from './lib/oracleDb';
-import { createOrdsClient, OrdsClient, OrdsError } from './lib/ordsClient';
+import { createOrdsClient, OrdsClient } from './lib/ordsClient';
 import {
   performOp,
   nowIso,
