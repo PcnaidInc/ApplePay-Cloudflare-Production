@@ -1,6 +1,5 @@
-export function nowIso(): string {
-  return new Date().toISOString();
-}
+// Re-export timestamp utilities for backward compatibility
+export { nowIso } from './timestamp';
 
 export function randomState(bytes: number = 16): string {
   const buf = new Uint8Array(bytes);

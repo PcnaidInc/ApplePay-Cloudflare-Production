@@ -72,6 +72,8 @@ This app uses **Oracle Autonomous AI Database** (formerly used Cloudflare D1) fo
    ```
 5. **Update wrangler.jsonc** with your ORDS base URL and schema alias
 
+**Timestamp Handling**: All timestamps use ISO 8601 format with UTC timezone (`YYYY-MM-DDTHH:MM:SS.sssZ`). See `TIMESTAMP_STANDARDIZATION.md` for details on consistent datetime handling across the application and Oracle database.
+
 
 ## Quick deploy (Cloudflare)
 
@@ -111,3 +113,5 @@ This app uses **Oracle Autonomous AI Database** (formerly used Cloudflare D1) fo
 - `docs/03_DEPLOYMENT.md`
 - `docs/04_LEGACY_ANALYSIS.md`
 - `apps/control-plane/oracle-migrations/README.md` - Database setup and migration guide
+- `ORACLE_MIGRATION_GUIDE.md` - Comprehensive Oracle migration documentation
+- `TIMESTAMP_STANDARDIZATION.md` - **Timestamp format standards and best practices**

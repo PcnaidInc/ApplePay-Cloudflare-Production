@@ -2,6 +2,7 @@
 // Replaces D1 data access from db.ts
 
 import { OrdsClient } from './ordsClient';
+import { nowIso, ORACLE_TIMESTAMP_FORMAT } from './timestamp';
 
 // Keep the same type definitions for compatibility
 export type ShopRow = {
@@ -47,10 +48,6 @@ export type WebhookEventRow = {
   processed_at: string | null;
   status: string | null;
 };
-
-function nowIso(): string {
-  return new Date().toISOString();
-}
 
 // -------------------- Shops --------------------
 
