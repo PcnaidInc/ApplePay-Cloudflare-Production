@@ -342,11 +342,7 @@ export async function updateMerchantDomainAppleStatus(
     SET 
       status = :status,
       last_error = :last_error,
-      apple_last_checked_at = CASE 
-        WHEN :apple_last_checked_at IS NOT NULL 
-        THEN TO_TIMESTAMP_TZ(:apple_last_checked_at, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')
-        ELSE apple_last_checked_at
-      END,
+      apple_last_checked_at = TO_TIMESTAMP_TZ(:apple_last_checked_at, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"'),
       updated_at = TO_TIMESTAMP_TZ(:updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')
     WHERE domain = :domain
   `;
