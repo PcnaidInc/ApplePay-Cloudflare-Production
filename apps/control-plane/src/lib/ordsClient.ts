@@ -71,10 +71,20 @@ export class OrdsClient {
   }
 
   /**
+   * Build the ORDS SQL endpoint URL, handling baseUrl that may already include /ords/
+   */
+  private getSqlEndpointUrl(): string {
+    const trimmedBase = this.config.baseUrl.replace(/\/+$/, '');
+    const baseHasOrds = trimmedBase.endsWith('/ords');
+    const base = baseHasOrds ? trimmedBase : `${trimmedBase}/ords`;
+    return `${base}/${this.config.schemaAlias}/_/sql`;
+  }
+
+  /**
    * Execute a SQL statement via ORDS REST-Enabled SQL
    */
   private async executeSql(sql: string, binds?: Record<string, any>): Promise<OrdsSqlResponse> {
-    const url = `${this.config.baseUrl}/ords/${this.config.schemaAlias}/_/sql`;
+    const url = this.getSqlEndpointUrl();
     
     const payload: OrdsSqlRequest = {
       statementText: sql,
@@ -150,14 +160,20 @@ export class OrdsClient {
   }
 
   /**
-   * Build authorization header based on auth mode
+   * Build authorization header based on auth mode.
+   *
+   * Currently only Basic authentication is supported. If an unsupported
+   * authMode (for example, "oauth") is configured, this will throw an
+   * error so that misconfiguration is detected early rather than silently
+   * falling back to Basic auth and causing confusing 401 responses.
    */
   private buildAuthHeader(): string {
-    if (this.config.authMode === 'oauth') {
-      // For OAuth, username/password are actually client_id/client_secret
-      // This is a simplified implementation - production should cache tokens
-      const credentials = btoa(`${this.config.username}:${this.config.password}`);
-      return `Basic ${credentials}`;
+    if (this.config.authMode && this.config.authMode !== 'basic') {
+      throw new OrdsError(
+        `Unsupported ORDS authMode "${this.config.authMode}". ` +
+          'Only "basic" authentication is currently supported.',
+        500
+      );
     }
 
     // Basic auth (default)

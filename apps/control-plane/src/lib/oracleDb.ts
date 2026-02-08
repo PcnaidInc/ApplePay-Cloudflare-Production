@@ -195,7 +195,7 @@ export async function upsertMerchantDomain(
         :environment AS environment,
         :status AS status,
         :last_error AS last_error,
-        :apple_last_checked_at AS apple_last_checked_at,
+        TO_TIMESTAMP_TZ(:apple_last_checked_at, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"') AS apple_last_checked_at,
         :cloudflare_hostname_id AS cloudflare_hostname_id,
         :cloudflare_hostname_status AS cloudflare_hostname_status,
         :cloudflare_ssl_status AS cloudflare_ssl_status,

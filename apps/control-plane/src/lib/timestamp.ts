@@ -83,10 +83,10 @@ export function isValidIsoTimestamp(value: string): boolean {
  * If Date object, converts to ISO
  * If invalid, returns current timestamp
  * 
- * @param value - Timestamp value (ISO string, Date, or any)
+ * @param value - Timestamp value (ISO string, Date, or unknown)
  * @returns Valid ISO 8601 timestamp string
  */
-export function ensureIsoTimestamp(value: any): string {
+export function ensureIsoTimestamp(value: unknown): string {
   if (typeof value === 'string' && isValidIsoTimestamp(value)) {
     return value;
   }
@@ -100,14 +100,15 @@ export function ensureIsoTimestamp(value: any): string {
 }
 
 /**
- * Oracle SQL helper: Converts ISO timestamp to Oracle TIMESTAMP WITH TIME ZONE
- * Use this in SQL bind parameters
+ * Oracle SQL helper: wraps a bind parameter as TIMESTAMP WITH TIME ZONE.
+ * Use this when binding ISO 8601 timestamp strings into Oracle SQL.
  * 
- * @param isoTimestamp - ISO 8601 timestamp string
- * @returns Oracle TO_TIMESTAMP_TZ SQL fragment
+ * @param bindName - Name of the SQL bind parameter (referenced as :{bindName})
+ * @returns Oracle TO_TIMESTAMP_TZ SQL fragment referencing :{bindName}
  * 
  * @example
- * const sql = `UPDATE shops SET updated_at = ${toOracleTimestamp(nowIso())}`;
+ * const sql = `UPDATE shops SET updated_at = ${toOracleTimestampSql('updatedAt')}`;
+ * // Results in: UPDATE shops SET updated_at = TO_TIMESTAMP_TZ(:updatedAt, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')
  */
 export function toOracleTimestampSql(bindName: string): string {
   return `TO_TIMESTAMP_TZ(:${bindName}, '${ORACLE_TIMESTAMP_FORMAT}')`;

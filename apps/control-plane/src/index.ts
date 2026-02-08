@@ -532,10 +532,18 @@ app.get('/api/debug/runtime', async (c) => {
   const u = new URL(c.req.url);
   if (!isAppHost(c.env, u)) return c.text('Not Found', 404);
 
+  let hasDB = false;
+  try {
+    hasDB = !!getOracleClient(c);
+  } catch (e) {
+    // Oracle client initialization failed - report as false rather than 500
+    hasDB = false;
+  }
+
   return c.json(
     {
       appleEnv: c.env.APPLE_ENV,   // "production" or "sandbox"
-      hasDB: !!getOracleClient(c),           // should be true
+      hasDB,                        // should be true
       hasKV: !!c.env.APPLEPAY_KV,  // should be true
     },
     200,
