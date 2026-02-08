@@ -6,7 +6,7 @@ function hexToBytes(hex: string): Uint8Array {
   if (clean.length % 2 !== 0) throw new Error('Invalid hex string length');
   const out = new Uint8Array(clean.length / 2);
   for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(clean.substr(i * 2, 2), 16);
+    out[i] = parseInt(clean.substring(i * 2, i * 2 + 2), 16);
   }
   return out;
 }
