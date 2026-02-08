@@ -90,8 +90,8 @@ export async function requireShopifySession(
  * Helper to get the authenticated session from context.
  * Should only be called after requireShopifySession middleware.
  */
-export function getShopifySession(c: Context<{ Variables: SessionVariables }>): { payload: ShopifySessionPayload; shop: string } {
-  const session = c.get('shopifySession');
+export function getShopifySession(c: Context<any>): { payload: ShopifySessionPayload; shop: string } {
+  const session = c.get('shopifySession') as { payload: ShopifySessionPayload; shop: string } | undefined;
   if (!session) {
     throw new Error('shopifySession not found in context - did you apply requireShopifySession middleware?');
   }
