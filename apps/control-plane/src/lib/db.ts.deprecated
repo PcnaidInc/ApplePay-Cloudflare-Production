@@ -1,0 +1,4 @@
+// DEPRECATED: This file is no longer used.
+// The app has been migrated from Cloudflare D1 to Oracle Autonomous AI Database.
+// See oracleDb.ts for the new implementation.
+

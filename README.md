@@ -1,6 +1,6 @@
 # Apple Pay Shopify App — Cloudflare Production Monorepo
 
-This repo replaces the legacy Azure Function “control plane” with a Cloudflare Worker + D1 + KV stack.
+This repo contains a Cloudflare Worker + Oracle + KV stack for Apple Pay domain registration.
 
 ## What this repo contains
 
@@ -43,9 +43,37 @@ This app uses **Shopify App Bridge v4** with standardized session token authenti
   - Exposes the Shopify embedded app backend (OAuth, API endpoints)
   - Creates Apple Pay merchant registrations (registerMerchant)
   - Provides a same-origin merchant validation endpoint at `/applepay/session`
-  - Persists state in Cloudflare D1
+  - Persists state in Oracle Autonomous AI Database via ORDS (REST)
 
 - **apps/admin-ui**: A Shopify-embedded admin UI (React + Polaris) used to onboard / view status.
+
+## Database: Oracle Autonomous AI Database
+
+This app uses **Oracle Autonomous AI Database** (formerly used Cloudflare D1) for persistent storage:
+
+- **Connection Method**: ORDS (Oracle REST Data Services) over HTTPS
+- **No Native Drivers**: Pure fetch-based SQL execution from Workers
+- **Tables**: `shops`, `merchant_domains`, `webhook_events`
+- **Migrations**: Manual SQL scripts in `apps/control-plane/oracle-migrations/`
+
+### Setting up Oracle Database
+
+1. **Provision Oracle Autonomous AI Database** (free tier: 2 ECPUs, 20GB)
+2. **Enable ORDS** (Database Actions)
+3. **Run migrations** (see `apps/control-plane/oracle-migrations/README.md`):
+   ```bash
+   # Via Database Actions SQL Worksheet or SQLcl
+   @apps/control-plane/oracle-migrations/001_initial_schema.sql
+   ```
+4. **Configure Worker secrets** (ORDS credentials):
+   ```bash
+   wrangler secret put ORDS_USERNAME
+   wrangler secret put ORDS_PASSWORD
+   ```
+5. **Update wrangler.jsonc** with your ORDS base URL and schema alias
+
+**Timestamp Handling**: All timestamps use ISO 8601 format with UTC timezone (`YYYY-MM-DDTHH:MM:SS.sssZ`). See `TIMESTAMP_STANDARDIZATION.md` for details on consistent datetime handling across the application and Oracle database.
+
 
 ## Quick deploy (Cloudflare)
 
@@ -55,15 +83,26 @@ This app uses **Shopify App Bridge v4** with standardized session token authenti
 2. Build UI
    - `npm -w apps/admin-ui run build`
 
-3. Configure Worker secrets + vars (see `docs/03_DEPLOYMENT.md`)
+3. Configure Oracle Database (see above section)
 
-4. Run D1 migrations
-   - `npm -w apps/control-plane run d1:migrate`
+4. Configure Worker secrets + vars (see `docs/03_DEPLOYMENT.md`)
+   ```bash
+   # Required Oracle secrets
+   wrangler secret put ORDS_USERNAME
+   wrangler secret put ORDS_PASSWORD
+   
+   # Required Shopify secrets
+   wrangler secret put SHOPIFY_API_SECRET
+   wrangler secret put CF_API_TOKEN
+   wrangler secret put APPLE_JWT_CERT_PEM
+   wrangler secret put APPLE_JWT_PRIVATE_KEY_PEM
+   ```
 
-5. Seed KV with the Apple partner verification file
+5. Update `wrangler.jsonc` with your ORDS_BASE_URL and ORDS_SCHEMA_ALIAS
+6. Seed KV with the Apple partner verification file
    - `VERIFY_FILE_PATH=/absolute/path/to/apple-developer-merchantid-domain-association npm -w apps/control-plane run kv:seed`
 
-6. Deploy
+7. Deploy
    - `npm -w apps/control-plane run deploy`
 
 ## Docs
@@ -73,3 +112,6 @@ This app uses **Shopify App Bridge v4** with standardized session token authenti
 - `docs/02_DATA_MODEL.md`
 - `docs/03_DEPLOYMENT.md`
 - `docs/04_LEGACY_ANALYSIS.md`
+- `apps/control-plane/oracle-migrations/README.md` - Database setup and migration guide
+- `ORACLE_MIGRATION_GUIDE.md` - Comprehensive Oracle migration documentation
+- `TIMESTAMP_STANDARDIZATION.md` - **Timestamp format standards and best practices**

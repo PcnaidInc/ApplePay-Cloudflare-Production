@@ -3,12 +3,8 @@
   "name": "applepay-control-plane",
   "main": "src/index.ts",
   "compatibility_date": "2026-02-06",
-  "compatibility_flags": ["nodejs_compat"],
-
-  // If your code expects Node-ish globals (process.env, etc.)
-  "node_compat": true,
-
-"compatibility_flags": [
+  "compatibility_flags": [
+    "nodejs_compat",
     "nodejs_compat_populate_process_env",
     "enable_nodejs_http_server_modules",
     "assets_navigation_has_no_effect"
@@ -20,12 +16,9 @@
   },
   "assets": {
     "directory": "../admin-ui/dist",
-    "binding": "ASSETS"
-  },
-
+    "binding": "ASSETS",
     // SPA fallback:
     "not_found_handling": "single-page-application",
-
     // Critical: ensure these routes hit Worker BEFORE SPA fallback serves index.html
     // Use route patterns; you can exclude with "!/some/path/*"
     "run_worker_first": [
@@ -41,12 +34,8 @@
       "id": "f8309ee4972841deaa3fa2ffdf55dca2"
    }
   ],
-  "d1_databases": [
-    { "binding": "DB",
-      "database_name": "db",
-      "database_id": "f10d39fe-df27-436d-9802-3baa97724c34"
-    }
-  ],
+  // D1 database removed - migrated to Oracle Autonomous AI Database
+  // Oracle connection is via ORDS (REST) - configured via environment variables below
   "mtls_certificates": [
     {
       "binding": "APPLE_MTLS",
@@ -66,7 +55,15 @@
     "SHOPIFY_APP_URL": "https://pcnaid-edge.com",
     "SHOPIFY_API_KEY": "0a03a301c38af1ddffdd773a18e025f4",
     "DEFAULT_DOMAIN": "pcnaid-edge.com",
-    "DEFAULT_MERCHANT_ID": "default"
+    "DEFAULT_MERCHANT_ID": "default",
+    
+    // Oracle Database Configuration (ORDS over HTTPS)
+    // IMPORTANT: Set ORDS_USERNAME and ORDS_PASSWORD via wrangler secrets:
+    //   wrangler secret put ORDS_USERNAME  # your-ords-username
+    //   wrangler secret put ORDS_PASSWORD  # your-ords-password
+    "ORDS_BASE_URL": "https://ge0c86fd7ea0f93-d4sozbvy7qtquvwm.adb.us-ashburn-1.oraclecloudapps.com/ords/",
+    "ORDS_SCHEMA_ALIAS": "postgres",
+    "ORDS_AUTH_MODE": "basic"
   },
   "triggers": {
     "crons": ["0 * * * *"]
