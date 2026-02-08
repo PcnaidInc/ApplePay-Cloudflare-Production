@@ -25,7 +25,9 @@
       "/api/*",
       "/auth/*",
       "/oauth/*",
-      "/webhooks/*"
+      "/webhooks/*",
+      "/.well-known/*",
+      "/applepay/*"
     ]
   },
 

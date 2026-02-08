@@ -23,7 +23,9 @@ export async function verifyShopifyHmac(args: {
   sp.delete('signature');
 
   // Shopify expects sorted lexicographically by key
-  const pairs = Array.from(sp.entries()).sort(([a], [b]) => a.localeCompare(b));
+  const pairs: [string, string][] = [];
+  sp.forEach((v, k) => pairs.push([k, v]));
+  pairs.sort(([a], [b]) => a.localeCompare(b));
   const message = pairs
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
     .join('&');

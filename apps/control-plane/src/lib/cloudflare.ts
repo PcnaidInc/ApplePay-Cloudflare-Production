@@ -62,24 +62,29 @@ export async function createCustomHostname(args: {
   hostname: string;
   customMetadata?: Record<string, string>;
 }): Promise<CfCustomHostname> {
+  const body: Record<string, any> = {
+    hostname: args.hostname,
+    ssl: {
+      method: 'http',
+      type: 'dv',
+      settings: {
+        min_tls_version: '1.2',
+        tls_1_3: 'on',
+        http2: 'on',
+      },
+    },
+  };
+
+  if (args.customMetadata && Object.keys(args.customMetadata).length > 0) {
+    body.custom_metadata = args.customMetadata;
+  }
+
   return cfApiFetch<CfCustomHostname>({
     apiToken: args.apiToken,
     path: _customHostnamesPath(args.zoneId),
     init: {
       method: 'POST',
-      body: JSON.stringify({
-        hostname: args.hostname,
-        // Optional metadata for our own tracking/debugging.
-        ssl: {
-          method: 'http',
-          type: 'dv',
-          settings: {
-            min_tls_version: '1.2',
-            tls_1_3: 'on',
-            http2: 'on',
-          },
-        },
-      }),
+      body: JSON.stringify(body),
     },
   });
 }
@@ -90,13 +95,18 @@ export async function editCustomHostname(args: {
   customHostnameId: string;
   customMetadata?: Record<string, string>;
 }): Promise<CfCustomHostname> {
+  const body: Record<string, any> = {};
+
+  if (args.customMetadata && Object.keys(args.customMetadata).length > 0) {
+    body.custom_metadata = args.customMetadata;
+  }
+
   return cfApiFetch<CfCustomHostname>({
     apiToken: args.apiToken,
     path: `${_customHostnamesPath(args.zoneId)}/${args.customHostnameId}`,
     init: {
       method: 'PATCH',
-      body: JSON.stringify({
-      }),
+      body: JSON.stringify(body),
     },
   });
 }

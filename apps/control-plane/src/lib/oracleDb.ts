@@ -425,6 +425,41 @@ export async function listMerchantDomainsByShop(
   return await client.queryMany<MerchantDomainRow>(sql, { shop });
 }
 
+/**
+ * List merchant domains with non-terminal statuses for background refresh.
+ * Returns domains that are PENDING, DNS_NOT_CONFIGURED, or NOT_STARTED.
+ */
+export async function listPendingMerchantDomains(
+  client: OrdsClient,
+  limit: number = 50
+): Promise<MerchantDomainRow[]> {
+  const sql = `
+    SELECT
+      id AS "id",
+      shop AS "shop",
+      shop_id AS "shop_id",
+      domain AS "domain",
+      partner_internal_merchant_identifier AS "partner_internal_merchant_identifier",
+      partner_merchant_name AS "partner_merchant_name",
+      encrypt_to AS "encrypt_to",
+      environment AS "environment",
+      status AS "status",
+      last_error AS "last_error",
+      TO_CHAR(apple_last_checked_at, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"') AS "apple_last_checked_at",
+      cloudflare_hostname_id AS "cloudflare_hostname_id",
+      cloudflare_hostname_status AS "cloudflare_hostname_status",
+      cloudflare_ssl_status AS "cloudflare_ssl_status",
+      TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"') AS "created_at",
+      TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"') AS "updated_at"
+    FROM merchant_domains
+    WHERE status IN ('PENDING', 'DNS_NOT_CONFIGURED', 'NOT_STARTED')
+    ORDER BY updated_at ASC
+    FETCH FIRST :row_limit ROWS ONLY
+  `;
+
+  return await client.queryMany<MerchantDomainRow>(sql, { row_limit: limit });
+}
+
 // -------------------- Webhook events --------------------
 
 /**

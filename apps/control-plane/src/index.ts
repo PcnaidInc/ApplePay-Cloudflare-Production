@@ -30,6 +30,7 @@ import {
   getMerchantDomainByDomain,
   getMerchantDomainByShop,
   getShopByShop,
+  listPendingMerchantDomains,
   logWebhookEvent,
   markShopUninstalled,
   upsertMerchantDomain,
@@ -41,10 +42,8 @@ import {
 } from './lib/oracleDb';
 import { createOrdsClient, OrdsClient } from './lib/ordsClient';
 import {
-  performOp,
   nowIso,
   randomState,
-  sha256Hex,
 } from './lib/util';
 
 // Schema management is now handled manually via Oracle migrations
@@ -200,6 +199,7 @@ type ApplePayStatusApi = {
   cloudflareSslStatus: string | null;
   dnsInstructions: DnsInstructionsApi | null;
   appleMerchantId: string | null;
+  appleLastCheckedAt: string | null;
 };
 
 // -----------------------------------------------------------------------------
@@ -254,18 +254,20 @@ app.onError((err, c) => {
     xRequestedWith.toLowerCase() === 'xmlhttprequest';
 
   if (!wantsJson && accept.includes('text/html')) {
+    // Escape user-controlled values to prevent XSS (these come from request headers)
+    const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     return c.html(
       `<!doctype html>
       <html><body style="font-family: system-ui; padding: 24px;">
         <h2>Something went wrong</h2>
-        <p>Request ID: <code>${requestId}</code></p>
-        <p>Flow ID: <code>${flowId}</code></p>
+        <p>Request ID: <code>${escHtml(requestId)}</code></p>
+        <p>Flow ID: <code>${escHtml(flowId)}</code></p>
       </body></html>`,
       500,
     );
   }
 
-  return c.json({ error: 'Internal error', msg: String(err), requestId, flowId }, 500);
+  return c.json({ error: 'Internal error', requestId, flowId }, 500);
 });
 
 // Global middleware for request tracking and correlation
@@ -360,6 +362,7 @@ function toApplePayStatus(row: MerchantDomainRow | null, dnsInstructions: DnsIns
       cloudflareSslStatus: null,
       dnsInstructions: null,
       appleMerchantId: null,
+      appleLastCheckedAt: null,
     };
   }
 
@@ -371,27 +374,8 @@ function toApplePayStatus(row: MerchantDomainRow | null, dnsInstructions: DnsIns
     cloudflareSslStatus: row.cloudflare_ssl_status,
     dnsInstructions,
     appleMerchantId: row.partner_internal_merchant_identifier,
+    appleLastCheckedAt: row.apple_last_checked_at,
   };
-}
-
-async function preflightVerificationFile(domain: string, expectedFile: string): Promise<{ ok: boolean; reason?: string }> {
-  const url = `https://${domain}${WELL_KNOWN_PATH}`;
-  try {
-    const res = await fetch(url, { method: 'GET' });
-    if (!res.ok) {
-      return { ok: false, reason: `HTTP ${res.status} fetching ${url}` };
-    }
-    const body = await res.text();
-    // Compare by hash to avoid whitespace/line-ending differences.
-    const got = await sha256Hex(body.trim());
-    const want = await sha256Hex(expectedFile.trim());
-    if (got !== want) {
-      return { ok: false, reason: `Verification file mismatch at ${url}` };
-    }
-    return { ok: true };
-  } catch (e: any) {
-    return { ok: false, reason: `Failed fetching ${url}: ${e?.message || String(e)}` };
-  }
 }
 
 function dnsInstructionsFor(domain: string, target: string): DnsInstructionsApi {
@@ -724,7 +708,7 @@ app.get("/auth/callback", async (c) => {
           shop,
           accessToken: tokenRes.accessToken,
           apiVersion: c.env.SHOPIFY_API_VERSION,
-          callbackUrl: `${c.env.SHOPIFY_APP_URL}/webhooks/app_uninstalled`,
+          callbackUrl: `${c.env.SHOPIFY_APP_URL}/webhooks/shopify/app-uninstalled`,
         });
       } catch (err: any) {
         const msg = String(err?.message || err);
@@ -1195,8 +1179,68 @@ const handler = {
     return app.fetch(request, env, ctx);
   },
 
-  scheduled: (_controller: ScheduledController, _env: Env, _ctx: ExecutionContext) => {
-    console.log("Cron trigger fired");
+  scheduled: (_controller: ScheduledController, env: Env, ctx: ExecutionContext) => {
+    ctx.waitUntil((async () => {
+      console.log(JSON.stringify({ ts: new Date().toISOString(), level: 'info', msg: 'cron.start' }));
+
+      let client: OrdsClient;
+      try {
+        client = createOrdsClient(env);
+      } catch (err) {
+        console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', msg: 'cron.oracle_client_failed', error: safeError(err) }));
+        return;
+      }
+
+      let pendingDomains;
+      try {
+        pendingDomains = await listPendingMerchantDomains(client, 50);
+      } catch (err) {
+        console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', msg: 'cron.list_pending_failed', error: safeError(err) }));
+        return;
+      }
+
+      console.log(JSON.stringify({ ts: new Date().toISOString(), level: 'info', msg: 'cron.pending_domains', count: pendingDomains.length }));
+
+      for (const md of pendingDomains) {
+        try {
+          await registerMerchant({
+            fetcher: env.APPLE_MTLS,
+            appleEnv: env.APPLE_ENV,
+            useJwt: env.APPLE_USE_JWT === 'true',
+            issuer: env.APPLE_ENCRYPT_TO,
+            certificatePem: env.APPLE_JWT_CERT_PEM,
+            privateKeyPem: env.APPLE_JWT_PRIVATE_KEY_PEM,
+            domain: md.domain,
+            partnerMerchantName: md.partner_merchant_name,
+            partnerInternalMerchantIdentifier: md.partner_internal_merchant_identifier,
+            encryptTo: md.encrypt_to,
+          });
+
+          await updateMerchantDomainAppleStatus(client, {
+            domain: md.domain,
+            status: 'VERIFIED',
+            lastError: null,
+            appleLastCheckedAt: nowIso(),
+          });
+
+          console.log(JSON.stringify({ ts: new Date().toISOString(), level: 'info', msg: 'cron.domain_verified', domain: md.domain }));
+        } catch (err: any) {
+          const message = err?.message || String(err);
+          const dnsish = /merchantid-domain-association|verification|dns|http\s*404|http\s*522/i.test(message);
+
+          await updateMerchantDomainAppleStatus(client, {
+            domain: md.domain,
+            status: dnsish ? 'DNS_NOT_CONFIGURED' : 'ERROR',
+            lastError: message,
+            appleLastCheckedAt: nowIso(),
+          }).catch(() => {});
+
+          console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', msg: 'cron.domain_failed', domain: md.domain, error: safeError(err) }));
+        }
+      }
+
+      console.log(JSON.stringify({ ts: new Date().toISOString(), level: 'info', msg: 'cron.complete', processed: pendingDomains.length }));
+    })());
   },
 };
 
