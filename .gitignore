@@ -5,3 +5,4 @@ node_modules
 *.log
 apps/admin-ui/dist
 apps/admin-ui/.vite
+apps/control-plane/.wrangler

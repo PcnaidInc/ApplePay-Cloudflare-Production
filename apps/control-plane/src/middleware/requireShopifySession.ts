@@ -89,8 +89,11 @@ export async function requireShopifySession(
 /**
  * Helper to get the authenticated session from context.
  * Should only be called after requireShopifySession middleware.
+ * 
+ * Note: Accepts any context type that includes SessionVariables to work with
+ * broader Hono app contexts that have additional Bindings/Variables.
  */
-export function getShopifySession(c: Context<{ Variables: SessionVariables }>): { payload: ShopifySessionPayload; shop: string } {
+export function getShopifySession(c: Context<any>): { payload: ShopifySessionPayload; shop: string } {
   const session = c.get('shopifySession');
   if (!session) {
     throw new Error('shopifySession not found in context - did you apply requireShopifySession middleware?');
