@@ -376,6 +376,20 @@ function toApplePayStatus(row: MerchantDomainRow | null, dnsInstructions: DnsIns
 
 async function preflightVerificationFile(domain: string, expectedFile: string): Promise<{ ok: boolean; reason?: string }> {
   const url = `https://${domain}${WELL_KNOWN_PATH}`;
+  
+  // SSRF protection: Reject private IP ranges and localhost
+  // This prevents attackers from using domain onboarding to probe internal network services
+  try {
+    const testUrl = new URL(url);
+    const hostname = testUrl.hostname;
+    // Block localhost and private IP ranges (RFC1918, RFC4193, link-local)
+    if (/^(localhost|127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|169\.254\.|::1|f[cd][0-9a-f]{2}:)/i.test(hostname)) {
+      return { ok: false, reason: `Domain resolves to private/internal address: ${hostname}` };
+    }
+  } catch {
+    return { ok: false, reason: `Invalid domain URL: ${url}` };
+  }
+  
   try {
     const res = await fetch(url, { method: 'GET' });
     if (!res.ok) {
