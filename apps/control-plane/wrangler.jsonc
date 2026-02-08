@@ -59,10 +59,10 @@
     
     // Oracle Database Configuration (ORDS over HTTPS)
     // IMPORTANT: Set ORDS_USERNAME and ORDS_PASSWORD via wrangler secrets:
-    //   wrangler secret put ORDS_USERNAME
-    //   wrangler secret put ORDS_PASSWORD
-    "ORDS_BASE_URL": "https://your-ords-base-url.oraclecloudapps.com",
-    "ORDS_SCHEMA_ALIAS": "ADMIN",
+    //   wrangler secret put ORDS_USERNAME  # postgres
+    //   wrangler secret put ORDS_PASSWORD  # WBWcBbcbPze9kN5
+    "ORDS_BASE_URL": "https://ge0c86fd7ea0f93-d4sozbvy7qtquvwm.adb.us-ashburn-1.oraclecloudapps.com/ords/",
+    "ORDS_SCHEMA_ALIAS": "postgres",
     "ORDS_AUTH_MODE": "basic"
   },
   "triggers": {
