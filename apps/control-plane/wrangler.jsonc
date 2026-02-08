@@ -61,7 +61,7 @@
     // IMPORTANT: Set ORDS_USERNAME and ORDS_PASSWORD via wrangler secrets:
     //   wrangler secret put ORDS_USERNAME  # your-ords-username
     //   wrangler secret put ORDS_PASSWORD  # your-ords-password
-    "ORDS_BASE_URL": ""ORDS_BASE_URL": "https://ge0c86fd7ea0f93-d4sozbvy7qtquvwm.adb.us-ashburn-1.oraclecloudapps.com",
+    "ORDS_BASE_URL": "https://ge0c86fd7ea0f93-d4sozbvy7qtquvwm.adb.us-ashburn-1.oraclecloudapps.com",
     "ORDS_SCHEMA_ALIAS": "postgres",
     "ORDS_AUTH_MODE": "basic"
   },
