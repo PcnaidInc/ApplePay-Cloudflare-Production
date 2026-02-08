@@ -100,7 +100,7 @@ ORDS_AUTH_MODE=basic  # or 'oauth'
 ## Troubleshooting
 
 **Error: Table already exists**
-- Migrations are idempotent where possible (use `CREATE TABLE IF NOT EXISTS` or check existence)
+- Migrations should be idempotent where possible (for example, check `USER_TABLES`/`USER_INDEXES` before creating objects, or rely on `schema_migrations` to avoid re-running them)
 - Check `schema_migrations` to see what's been applied
 
 **Error: Insufficient privileges**
